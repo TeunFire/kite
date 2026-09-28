@@ -14,27 +14,26 @@ import { cn } from "@/lib/utils";
 import { useMemo, useState } from "react";
 
 // Text, voice, announcement, stage
-const sendableChannelTypes = new Set([0, 2, 5, 13]);
+const sendableChannelTypes = [0, 2, 5, 13];
 
 export default function ChannelSelect({
   guildId,
   value,
   onChange,
-  sendableOnly = true,
+  types = sendableChannelTypes,
+  placeholder = "Select channel...",
 }: {
   guildId: string | null;
   value: string | null;
   onChange: (value: string | null) => void;
-  // Whether to only list channels messages can be sent to.
-  sendableOnly?: boolean;
+  // The channel types to list, the ones messages can be sent to by default.
+  types?: number[];
+  placeholder?: string;
 }) {
   const allChannels = useAppStateGuildChannels(guildId);
   const channels = useMemo(
-    () =>
-      allChannels?.filter(
-        (c) => c && (!sendableOnly || sendableChannelTypes.has(c.type))
-      ),
-    [allChannels, sendableOnly]
+    () => allChannels?.filter((c) => c && types.includes(c.type)),
+    [allChannels, types]
   );
 
   const [open, setOpen] = useState(false);
@@ -49,9 +48,7 @@ export default function ChannelSelect({
           className="w-full justify-between truncate flex"
         >
           <div className="truncate">
-            {value
-              ? channels?.find((c) => c!.id === value)?.name
-              : "Select channel..."}
+            {value ? channels?.find((c) => c!.id === value)?.name : placeholder}
           </div>
           <ChevronsUpDownIcon className="ml-2 h-4 w-4 shrink-0 opacity-50" />
         </Button>
