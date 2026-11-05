@@ -1,0 +1,21 @@
+import { numericOrPlaceholder } from "../flow/dataSchema";
+import { BlockDefinition } from "./types";
+
+export const discordGuildGet: BlockDefinition = {
+  type: "action_guild_get",
+  id_prefix: "guild",
+  title: "Get server",
+  description: "Get a server / guild by ID",
+  icon: "server",
+  category: "Servers",
+  requires: ["discord"],
+  credits: 0,
+  fields: [
+    {
+      name: "guild_target",
+      schema: numericOrPlaceholder("ID of the server."),
+    },
+  ],
+  result: { thing: "discord_guild" },
+  run: { kind: "custom" },
+};

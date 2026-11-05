@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/diamondburned/arikawa/v3/gateway"
 	"github.com/diamondburned/arikawa/v3/state"
 	disstore "github.com/diamondburned/arikawa/v3/state/store"
+	"github.com/diamondburned/arikawa/v3/utils/httputil"
 	"github.com/diamondburned/arikawa/v3/utils/sendpart"
 	"github.com/kitecloud/kite/kite-service/internal/model"
 	"github.com/kitecloud/kite/kite-service/internal/store"
@@ -32,15 +34,243 @@ import (
 	"gopkg.in/guregu/null.v4"
 )
 
+type TableProvider struct {
+	appID string
+	store store.TableStore
+}
+
+func NewTableProvider(appID string, tableStore store.TableStore) *TableProvider {
+	return &TableProvider{appID: appID, store: tableStore}
+}
+
+func (p *TableProvider) InsertRow(ctx context.Context, tableID string, data map[string]any) (*provider.TableRow, error) {
+	if _, err := p.store.Table(ctx, p.appID, tableID); err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	row, err := p.store.CreateTableRow(ctx, &model.TableRow{
+		ID: util.UniqueID(), TableID: tableID, Data: data, CreatedAt: now, UpdatedAt: now,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := p.recordAudit(ctx, tableID, "row_create", row.ID, nil, row); err != nil {
+		return nil, err
+	}
+	return &provider.TableRow{ID: row.ID, Data: row.Data}, nil
+}
+
+func (p *TableProvider) GetRow(ctx context.Context, tableID, rowID string) (*provider.TableRow, error) {
+	rows, err := p.store.TableRows(ctx, p.appID, tableID)
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		if row.ID == rowID {
+			return &provider.TableRow{ID: row.ID, Data: row.Data}, nil
+		}
+	}
+	return nil, provider.ErrNotFound
+}
+
+func (p *TableProvider) FindRows(ctx context.Context, tableID string, filters []provider.TableFilter, limit int) ([]*provider.TableRow, error) {
+	rows, err := p.store.TableRows(ctx, p.appID, tableID)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]*provider.TableRow, 0, min(limit, len(rows)))
+	for _, row := range rows {
+		matches := true
+		for _, filter := range filters {
+			value, ok := row.Data[filter.Column]
+			if !ok || !tableFilterMatches(value, filter.Operator, filter.Value) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			result = append(result, &provider.TableRow{ID: row.ID, Data: row.Data})
+			if len(result) == limit {
+				break
+			}
+		}
+	}
+	return result, nil
+}
+
+func (p *TableProvider) UpdateRow(ctx context.Context, tableID, rowID string, data map[string]any) (*provider.TableRow, error) {
+	before, err := p.GetRow(ctx, tableID, rowID)
+	if err != nil {
+		return nil, err
+	}
+	row, err := p.store.UpdateTableRow(ctx, &model.TableRow{
+		ID: rowID, TableID: tableID, Data: data, UpdatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := p.recordAudit(ctx, tableID, "row_update", row.ID, before, row); err != nil {
+		return nil, err
+	}
+	return &provider.TableRow{ID: row.ID, Data: row.Data}, nil
+}
+
+func (p *TableProvider) DeleteRow(ctx context.Context, tableID, rowID string) error {
+	before, err := p.GetRow(ctx, tableID, rowID)
+	if err != nil {
+		return err
+	}
+	if err := p.store.DeleteTableRow(ctx, tableID, rowID); err != nil {
+		return err
+	}
+	return p.recordAudit(ctx, tableID, "row_delete", rowID, before, nil)
+}
+
+func toProviderColumn(column model.TableColumn) provider.TableColumn {
+	return provider.TableColumn{ID: column.ID, Name: column.Name, Type: column.Type, Required: column.Required, Default: column.Default, ReferenceTableID: column.ReferenceTableID}
+}
+
+func toModelColumn(column provider.TableColumn) model.TableColumn {
+	return model.TableColumn{ID: column.ID, Name: column.Name, Type: column.Type, Required: column.Required, Default: column.Default, ReferenceTableID: column.ReferenceTableID}
+}
+
+func (p *TableProvider) ListColumns(ctx context.Context, tableID string) ([]provider.TableColumn, error) {
+	table, err := p.store.Table(ctx, p.appID, tableID)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]provider.TableColumn, len(table.Columns))
+	for i, column := range table.Columns {
+		result[i] = toProviderColumn(column)
+	}
+	return result, nil
+}
+
+func (p *TableProvider) AddColumn(ctx context.Context, tableID string, column provider.TableColumn) (provider.TableColumn, error) {
+	table, err := p.store.Table(ctx, p.appID, tableID)
+	if err != nil {
+		return provider.TableColumn{}, err
+	}
+	for _, existing := range table.Columns {
+		if existing.ID == column.ID {
+			return provider.TableColumn{}, fmt.Errorf("column %q already exists", column.ID)
+		}
+	}
+	before := cloneTable(table)
+	table.Columns = append(table.Columns, toModelColumn(column))
+	table.UpdatedAt = time.Now().UTC()
+	updated, err := p.store.UpdateTable(ctx, table)
+	if err != nil {
+		return provider.TableColumn{}, err
+	}
+	if err := p.recordAudit(ctx, tableID, "table_update", "", before, updated); err != nil {
+		return provider.TableColumn{}, err
+	}
+	return column, nil
+}
+
+func (p *TableProvider) UpdateColumn(ctx context.Context, tableID, columnID string, column provider.TableColumn) (provider.TableColumn, error) {
+	table, err := p.store.Table(ctx, p.appID, tableID)
+	if err != nil {
+		return provider.TableColumn{}, err
+	}
+	found := false
+	for i := range table.Columns {
+		if table.Columns[i].ID == columnID {
+			before := cloneTable(table)
+			table.Columns[i] = toModelColumn(column)
+			found = true
+			table.UpdatedAt = time.Now().UTC()
+			updated, updateErr := p.store.UpdateTable(ctx, table)
+			if updateErr != nil {
+				return provider.TableColumn{}, updateErr
+			}
+			if auditErr := p.recordAudit(ctx, tableID, "table_update", "", before, updated); auditErr != nil {
+				return provider.TableColumn{}, auditErr
+			}
+			break
+		}
+	}
+	if !found {
+		return provider.TableColumn{}, provider.ErrNotFound
+	}
+	return column, nil
+}
+
+func (p *TableProvider) DeleteColumn(ctx context.Context, tableID, columnID string) error {
+	table, err := p.store.Table(ctx, p.appID, tableID)
+	if err != nil {
+		return err
+	}
+	for i, column := range table.Columns {
+		if column.ID == columnID {
+			before := cloneTable(table)
+			table.Columns = append(table.Columns[:i], table.Columns[i+1:]...)
+			table.UpdatedAt = time.Now().UTC()
+			updated, err := p.store.UpdateTable(ctx, table)
+			if err != nil {
+				return err
+			}
+			return p.recordAudit(ctx, tableID, "table_update", "", before, updated)
+		}
+	}
+	return provider.ErrNotFound
+}
+
+func cloneTable(table *model.Table) *model.Table {
+	copy := *table
+	copy.Columns = append([]model.TableColumn(nil), table.Columns...)
+	return &copy
+}
+
+func (p *TableProvider) recordAudit(ctx context.Context, tableID, action, rowID string, before, after any) error {
+	beforeData, err := json.Marshal(before)
+	if err != nil {
+		return err
+	}
+	afterData, err := json.Marshal(after)
+	if err != nil {
+		return err
+	}
+	return p.store.CreateTableAudit(ctx, &model.TableAudit{
+		ID: util.UniqueID(), AppID: p.appID, TableID: tableID, ActorUserID: "flow",
+		Action: action, RowID: rowID, BeforeData: beforeData, AfterData: afterData, CreatedAt: time.Now().UTC(),
+	})
+}
+
+func tableFilterMatches(value any, operator string, expected any) bool {
+	switch operator {
+	case "equals", "eq":
+		return reflect.DeepEqual(value, expected)
+	case "not_equals", "neq":
+		return !reflect.DeepEqual(value, expected)
+	case "contains":
+		actual, ok := value.(string)
+		target, targetOK := expected.(string)
+		return ok && targetOK && strings.Contains(actual, target)
+	case "greater_than", "gt", "less_than", "lt":
+		actual, ok := value.(float64)
+		target, targetOK := expected.(float64)
+		if !ok || !targetOK {
+			return false
+		}
+		if operator == "greater_than" || operator == "gt" {
+			return actual > target
+		}
+		return actual < target
+	default:
+		return false
+	}
+}
+
 // FeatureProvider resolves the premium features an app has access to.
 type FeatureProvider interface {
-	AppFeatures(ctx context.Context, appID string) model.Features
+	AppFeatures(ctx context.Context, appID string) (model.Features, error)
 	AppFeaturesForApps(ctx context.Context, appIDs []string) (map[string]model.Features, error)
 }
 
 type DiscordProvider struct {
-	provider.MockDiscordProvider // TODO: remove this
-
 	appID           string
 	appStore        store.AppStore
 	featureProvider FeatureProvider
@@ -163,7 +393,7 @@ func (p *DiscordProvider) CreateInteractionResponse(ctx context.Context, interac
 		} `json:"resource"`
 	}
 	if err := sendpart.POST(p.session.Client.Client, response, &res, endpoint); err != nil {
-		return nil, fmt.Errorf("failed to respond to interaction: %w", err)
+		return nil, fmt.Errorf("failed to respond to interaction: %w", util.WithoutRequestURL(err))
 	}
 
 	p.interactionsWithResponse[interactionID] = struct{}{}
@@ -177,7 +407,7 @@ func (p *DiscordProvider) CreateInteractionResponse(ctx context.Context, interac
 func (p *DiscordProvider) EditInteractionResponse(ctx context.Context, applicationID discord.AppID, token string, response api.EditInteractionResponseData) (*discord.Message, error) {
 	msg, err := p.session.EditInteractionResponse(applicationID, token, response)
 	if err != nil {
-		return nil, fmt.Errorf("failed to edit interaction response: %w", err)
+		return nil, fmt.Errorf("failed to edit interaction response: %w", util.WithoutRequestURL(err))
 	}
 
 	return msg, err
@@ -186,7 +416,7 @@ func (p *DiscordProvider) EditInteractionResponse(ctx context.Context, applicati
 func (p *DiscordProvider) DeleteInteractionResponse(ctx context.Context, applicationID discord.AppID, token string) error {
 	err := p.session.DeleteInteractionResponse(applicationID, token)
 	if err != nil {
-		return fmt.Errorf("failed to delete interaction response: %w", err)
+		return fmt.Errorf("failed to delete interaction response: %w", util.WithoutRequestURL(err))
 	}
 
 	return nil
@@ -195,7 +425,7 @@ func (p *DiscordProvider) DeleteInteractionResponse(ctx context.Context, applica
 func (p *DiscordProvider) CreateInteractionFollowup(ctx context.Context, applicationID discord.AppID, token string, data api.InteractionResponseData) (*discord.Message, error) {
 	msg, err := p.session.FollowUpInteraction(applicationID, token, data)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create interaction followup: %w", err)
+		return nil, fmt.Errorf("failed to create interaction followup: %w", util.WithoutRequestURL(err))
 	}
 
 	return msg, nil
@@ -204,7 +434,7 @@ func (p *DiscordProvider) CreateInteractionFollowup(ctx context.Context, applica
 func (p *DiscordProvider) EditInteractionFollowup(ctx context.Context, applicationID discord.AppID, token string, messageID discord.MessageID, data api.EditInteractionResponseData) (*discord.Message, error) {
 	msg, err := p.session.EditInteractionFollowup(applicationID, messageID, token, data)
 	if err != nil {
-		return nil, fmt.Errorf("failed to edit interaction followup: %w", err)
+		return nil, fmt.Errorf("failed to edit interaction followup: %w", util.WithoutRequestURL(err))
 	}
 
 	return msg, nil
@@ -213,7 +443,7 @@ func (p *DiscordProvider) EditInteractionFollowup(ctx context.Context, applicati
 func (p *DiscordProvider) DeleteInteractionFollowup(ctx context.Context, applicationID discord.AppID, token string, messageID discord.MessageID) error {
 	err := p.session.DeleteInteractionFollowup(applicationID, messageID, token)
 	if err != nil {
-		return fmt.Errorf("failed to delete interaction followup: %w", err)
+		return fmt.Errorf("failed to delete interaction followup: %w", util.WithoutRequestURL(err))
 	}
 
 	return nil
@@ -237,20 +467,6 @@ func (p *DiscordProvider) EditMessage(ctx context.Context, channelID discord.Cha
 	return msg, nil
 }
 
-func (p *DiscordProvider) DeleteMessage(
-	ctx context.Context,
-	channelID discord.ChannelID,
-	messageID discord.MessageID,
-	reason api.AuditLogReason,
-) error {
-	err := p.session.DeleteMessage(channelID, messageID, reason)
-	if err != nil {
-		return fmt.Errorf("failed to delete message: %w", err)
-	}
-
-	return nil
-}
-
 func (p *DiscordProvider) CreateMessageReaction(ctx context.Context, channelID discord.ChannelID, messageID discord.MessageID, emoji discord.APIEmoji) error {
 	err := p.session.React(channelID, messageID, emoji)
 	if err != nil {
@@ -260,84 +476,59 @@ func (p *DiscordProvider) CreateMessageReaction(ctx context.Context, channelID d
 	return nil
 }
 
-func (p *DiscordProvider) DeleteMessageReaction(ctx context.Context, channelID discord.ChannelID, messageID discord.MessageID, emoji discord.APIEmoji) error {
-	err := p.session.Unreact(channelID, messageID, emoji)
-	if err != nil {
-		return fmt.Errorf("failed to delete message reaction: %w", err)
+func (p *DiscordProvider) CreatePoll(ctx context.Context, channelID discord.ChannelID, data provider.CreatePollData) (*discord.Message, error) {
+	// arikawa's SendMessageData has no poll field, so the request is built by hand.
+	body := struct {
+		Poll provider.CreatePollData `json:"poll"`
+	}{
+		Poll: data,
 	}
 
-	return nil
+	var msg discord.Message
+	err := p.session.RequestJSON(
+		&msg,
+		http.MethodPost,
+		api.EndpointChannels+channelID.String()+"/messages",
+		httputil.WithJSONBody(body),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create poll: %w", err)
+	}
+
+	return &msg, nil
 }
 
-func (p *DiscordProvider) PinMessage(ctx context.Context, channelID discord.ChannelID, messageID discord.MessageID, reason api.AuditLogReason) error {
-	err := p.session.PinMessage(channelID, messageID, reason)
-	if err != nil {
-		return fmt.Errorf("failed to pin message: %w", err)
+func (p *DiscordProvider) ForwardMessage(ctx context.Context, channelID discord.ChannelID, messageChannelID discord.ChannelID, messageID discord.MessageID) (*discord.Message, error) {
+	// arikawa rejects messages without content, embeds, files or components,
+	// which forwards are, so the request is built by hand.
+	body := struct {
+		MessageReference discord.MessageReference `json:"message_reference"`
+	}{
+		MessageReference: discord.MessageReference{
+			Type:      discord.MessageReferenceTypeForward,
+			MessageID: messageID,
+			ChannelID: messageChannelID,
+		},
 	}
 
-	return nil
-}
-
-func (p *DiscordProvider) UnpinMessage(ctx context.Context, channelID discord.ChannelID, messageID discord.MessageID, reason api.AuditLogReason) error {
-	err := p.session.UnpinMessage(channelID, messageID, reason)
+	var msg discord.Message
+	err := p.session.RequestJSON(
+		&msg,
+		http.MethodPost,
+		api.EndpointChannels+channelID.String()+"/messages",
+		httputil.WithJSONBody(body),
+	)
 	if err != nil {
-		return fmt.Errorf("failed to unpin message: %w", err)
+		return nil, fmt.Errorf("failed to forward message: %w", err)
 	}
 
-	return nil
-}
-
-func (p *DiscordProvider) BanMember(ctx context.Context, guildID discord.GuildID, userID discord.UserID, data api.BanData) error {
-	err := p.session.Ban(guildID, userID, data)
-	if err != nil {
-		return fmt.Errorf("failed to ban member: %w", err)
-	}
-
-	return nil
-}
-
-func (p *DiscordProvider) UnbanMember(ctx context.Context, guildID discord.GuildID, userID discord.UserID, reason api.AuditLogReason) error {
-	err := p.session.Unban(guildID, userID, reason)
-	if err != nil {
-		return fmt.Errorf("failed to unban member: %w", err)
-	}
-
-	return nil
-}
-
-func (p *DiscordProvider) KickMember(ctx context.Context, guildID discord.GuildID, userID discord.UserID, reason api.AuditLogReason) error {
-	err := p.session.Kick(guildID, userID, reason)
-	if err != nil {
-		return fmt.Errorf("failed to kick member: %w", err)
-	}
-
-	return nil
+	return &msg, nil
 }
 
 func (p *DiscordProvider) EditMember(ctx context.Context, guildID discord.GuildID, userID discord.UserID, data api.ModifyMemberData) error {
 	err := p.session.ModifyMember(guildID, userID, data)
 	if err != nil {
 		return fmt.Errorf("failed to edit member: %w", err)
-	}
-
-	return nil
-}
-
-func (p *DiscordProvider) AddMemberRole(ctx context.Context, guildID discord.GuildID, userID discord.UserID, roleID discord.RoleID, reason api.AuditLogReason) error {
-	err := p.session.AddRole(guildID, userID, roleID, api.AddRoleData{
-		AuditLogReason: reason,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to add role: %w", err)
-	}
-
-	return nil
-}
-
-func (p *DiscordProvider) RemoveMemberRole(ctx context.Context, guildID discord.GuildID, userID discord.UserID, roleID discord.RoleID, reason api.AuditLogReason) error {
-	err := p.session.RemoveRole(guildID, userID, roleID, reason)
-	if err != nil {
-		return fmt.Errorf("failed to remove role: %w", err)
 	}
 
 	return nil
@@ -370,15 +561,6 @@ func (p *DiscordProvider) EditChannel(ctx context.Context, channelID discord.Cha
 	return nil
 }
 
-func (p *DiscordProvider) DeleteChannel(ctx context.Context, channelID discord.ChannelID, reason api.AuditLogReason) error {
-	err := p.session.DeleteChannel(channelID, reason)
-	if err != nil {
-		return fmt.Errorf("failed to delete channel: %w", err)
-	}
-
-	return nil
-}
-
 func (p *DiscordProvider) StartThreadWithMessage(ctx context.Context, channelID discord.ChannelID, messageID discord.MessageID, data api.StartThreadData) (*discord.Channel, error) {
 	thread, err := p.session.StartThreadWithMessage(channelID, messageID, data)
 	if err != nil {
@@ -397,22 +579,21 @@ func (p *DiscordProvider) StartThreadWithoutMessage(ctx context.Context, channel
 	return thread, nil
 }
 
-func (p *DiscordProvider) AddThreadMember(ctx context.Context, channelID discord.ChannelID, userID discord.UserID) error {
-	err := p.session.AddThreadMember(channelID, userID)
+func (p *DiscordProvider) StartThreadInForum(ctx context.Context, channelID discord.ChannelID, data api.StartForumThreadData) (*discord.Channel, error) {
+	thread, err := p.session.StartThreadInForum(channelID, data)
 	if err != nil {
-		return fmt.Errorf("failed to add thread member: %w", err)
+		return nil, fmt.Errorf("failed to start thread in forum: %w", err)
 	}
 
-	return nil
+	return thread, nil
 }
 
-func (p *DiscordProvider) RemoveThreadMember(ctx context.Context, channelID discord.ChannelID, userID discord.UserID) error {
-	err := p.session.RemoveThreadMember(channelID, userID)
-	if err != nil {
-		return fmt.Errorf("failed to remove thread member: %w", err)
-	}
+func (p *DiscordProvider) BotToken() string {
+	return strings.TrimPrefix(p.session.Token, "Bot ")
+}
 
-	return nil
+func (p *DiscordProvider) APIRequest(ctx context.Context, req provider.DiscordAPIRequest) ([]byte, error) {
+	return util.DiscordAPIRequest(ctx, p.session.Client, req)
 }
 
 func (p *DiscordProvider) UpdateVoiceState(ctx context.Context, guildID discord.GuildID, channelID discord.ChannelID, selfMute bool, selfDeaf bool) error {
@@ -435,14 +616,18 @@ func (p *DiscordProvider) UpdateVoiceState(ctx context.Context, guildID discord.
 
 func (p *DiscordProvider) UpdatePresence(ctx context.Context, status discord.Status, activity discord.Activity) error {
 	// Part of the same premium feature as rotating statuses in the app settings
-	if !p.featureProvider.AppFeatures(ctx, p.appID).RotatingStatus {
+	features, err := p.featureProvider.AppFeatures(ctx, p.appID)
+	if err != nil {
+		return fmt.Errorf("failed to get app features: %w", err)
+	}
+	if !features.RotatingStatus {
 		return fmt.Errorf("setting the status from a flow requires premium")
 	}
 	if err := p.allowGatewayCommand(); err != nil {
 		return err
 	}
 
-	err := p.session.SendGateway(ctx, &gateway.UpdatePresenceCommand{
+	err = p.session.SendGateway(ctx, &gateway.UpdatePresenceCommand{
 		Status:     status,
 		Activities: []discord.Activity{activity},
 	})
@@ -453,11 +638,44 @@ func (p *DiscordProvider) UpdatePresence(ctx context.Context, status discord.Sta
 	return nil
 }
 
+func (p *DiscordProvider) LeaveGuild(ctx context.Context, guildID discord.GuildID) error {
+	err := p.session.Client.WithContext(ctx).LeaveGuild(guildID)
+	if err != nil {
+		return fmt.Errorf("failed to leave server: %w", err)
+	}
+
+	return nil
+}
+
 func (p *DiscordProvider) allowGatewayCommand() error {
 	if !p.rateLimiter.Allow(p.appID, gatewayCommandRateLimit) {
 		return fmt.Errorf("blocks that change the status or voice state are rate limited, try again in a few seconds")
 	}
 	return nil
+}
+
+func (p *DiscordProvider) AppVerifyKey(ctx context.Context) (string, error) {
+	app, err := p.appStore.App(ctx, p.appID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get app: %w", err)
+	}
+	if app.DiscordVerifyKey.Valid {
+		return app.DiscordVerifyKey.String, nil
+	}
+
+	// Fetched the first time it's needed, as it never changes.
+	discordApp, err := p.session.Client.WithContext(ctx).CurrentApplication()
+	if err != nil {
+		return "", fmt.Errorf("failed to get the app's public key from Discord: %w", err)
+	}
+	if err := p.appStore.UpdateAppDiscordVerifyKey(ctx, p.appID, discordApp.VerifyKey); err != nil {
+		slog.Error(
+			"Failed to store app verify key",
+			slog.String("app_id", p.appID),
+			slog.String("error", err.Error()),
+		)
+	}
+	return discordApp.VerifyKey, nil
 }
 
 func (p *DiscordProvider) MarkInteractionResponded(interactionID discord.InteractionID) {
@@ -553,6 +771,14 @@ func (p *HTTPProvider) HTTPRequest(ctx context.Context, req *http.Request) (*htt
 	return p.client.Do(req)
 }
 
+func (p *HTTPProvider) HTTPRequestWithoutRedirects(ctx context.Context, req *http.Request) (*http.Response, error) {
+	client := *p.client
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return client.Do(req)
+}
+
 type AIProvider struct {
 	client *openai.Client
 }
@@ -563,29 +789,16 @@ func NewAIProvider(client *openai.Client) *AIProvider {
 	}
 }
 
-func (p *AIProvider) CreateResponse(ctx context.Context, opts provider.CreateResponseOpts) (string, error) {
+func (p *AIProvider) CreateResponse(ctx context.Context, opts provider.CreateResponseOpts) (provider.AIResponse, error) {
 	tools := []responses.ToolUnionParam{}
 	for _, tool := range opts.Tools {
 		switch tool {
-		case provider.AIToolTypeWebSearchPreview:
-			tools = append(tools, responses.ToolUnionParam{
-				OfWebSearchPreview: &responses.WebSearchPreviewToolParam{
-					Type: responses.WebSearchPreviewToolTypeWebSearchPreview,
-				},
-			})
+		case provider.AIToolTypeWebSearch:
+			tools = append(tools, responses.ToolParamOfWebSearch(responses.WebSearchToolTypeWebSearch))
 		}
 	}
 
-	inputs := responses.ResponseInputParam{
-		{
-			OfMessage: &responses.EasyInputMessageParam{
-				Role: responses.EasyInputMessageRoleUser,
-				Content: responses.EasyInputMessageContentUnionParam{
-					OfString: openai.String(opts.Prompt),
-				},
-			},
-		},
-	}
+	inputs := responses.ResponseInputParam{}
 	if opts.SystemPrompt != "" {
 		inputs = append(inputs, responses.ResponseInputItemUnionParam{
 			OfMessage: &responses.EasyInputMessageParam{
@@ -596,50 +809,223 @@ func (p *AIProvider) CreateResponse(ctx context.Context, opts provider.CreateRes
 			},
 		})
 	}
-
-	model := opts.Model
-	if model == "" {
-		model = openai.ChatModelGPT4oMini
-	}
-
-	maxOutputTokens := 500
-	if opts.MaxOutputTokens > 0 && opts.MaxOutputTokens < maxOutputTokens {
-		maxOutputTokens = opts.MaxOutputTokens
-	}
+	inputs = append(inputs, responses.ResponseInputItemUnionParam{
+		OfMessage: &responses.EasyInputMessageParam{
+			Role: responses.EasyInputMessageRoleUser,
+			Content: responses.EasyInputMessageContentUnionParam{
+				OfString: openai.String(opts.Prompt),
+			},
+		},
+	})
 
 	params := responses.ResponseNewParams{
-		Model: model,
+		Model: opts.Model,
 		Input: responses.ResponseNewParamsInputUnion{
 			OfInputItemList: inputs,
 		},
-		MaxOutputTokens: openai.Int(int64(maxOutputTokens)),
-		Tools:           tools,
+		Tools: tools,
+		// Prompts contain Discord message content, which OpenAI shouldn't keep.
+		Store: openai.Bool(false),
 	}
-	// GPT-5 models reason before answering, and the reasoning counts towards
-	// the output tokens, so less of it leaves more room for the answer.
-	if strings.HasPrefix(model, "gpt-5") {
-		params.Reasoning = shared.ReasoningParam{Effort: shared.ReasoningEffortLow}
+	if opts.MaxOutputTokens > 0 {
+		params.MaxOutputTokens = openai.Int(int64(opts.MaxOutputTokens))
+	}
+	if opts.ReasoningEffort != "" {
+		params.Reasoning = shared.ReasoningParam{Effort: shared.ReasoningEffort(opts.ReasoningEffort)}
+	}
+	if opts.MaxToolCalls > 0 {
+		params.MaxToolCalls = openai.Int(int64(opts.MaxToolCalls))
+	}
+	if opts.JSONSchema != nil {
+		format := responses.ResponseFormatTextConfigParamOfJSONSchema(opts.JSONSchema.Name, opts.JSONSchema.Schema)
+		format.OfJSONSchema.Strict = openai.Bool(true)
+		params.Text = responses.ResponseTextConfigParam{Format: format}
 	}
 
 	resp, err := p.client.Responses.New(ctx, params)
 	if err != nil {
-		return "", fmt.Errorf("failed to create response: %w", err)
+		return provider.AIResponse{}, fmt.Errorf("failed to create response: %w", err)
 	}
 
-	return resp.OutputText(), nil
+	res := provider.AIResponse{
+		Text:         resp.OutputText(),
+		OutputTokens: int(resp.Usage.OutputTokens),
+	}
+
+	// Reasoning can use up the whole token budget and leave no answer, which
+	// would otherwise pass as an empty but successful one.
+	if res.Text == "" && resp.Status == responses.ResponseStatusIncomplete {
+		return res, fmt.Errorf("response incomplete: %s", resp.IncompleteDetails.Reason)
+	}
+	return res, nil
+}
+
+const openRouterDecisionsURL = "https://openrouter.ai/api/alpha/decisions"
+
+// DecisionProvider asks decision models through OpenRouter's decisions API.
+type DecisionProvider struct {
+	client *http.Client
+	apiKey string
+	url    string
+}
+
+func NewDecisionProvider(client *http.Client, apiKey string) *DecisionProvider {
+	return &DecisionProvider{
+		client: client,
+		apiKey: apiKey,
+		url:    openRouterDecisionsURL,
+	}
+}
+
+type decisionQuestion struct {
+	Type         provider.DecisionType `json:"type"`
+	Instructions string                `json:"instructions"`
+	Criteria     any                   `json:"criteria"`
+}
+
+type decisionAnswer struct {
+	Choice        string             `json:"choice"`
+	Noul          float64            `json:"noul"`
+	Score         float64            `json:"score"`
+	Confidence    *float64           `json:"confidence"`
+	Probabilities map[string]float64 `json:"probabilities"`
+}
+
+func (p *DecisionProvider) Decide(ctx context.Context, opts provider.DecideOpts) (provider.Decision, error) {
+	var criteria any
+	switch opts.Type {
+	case provider.DecisionTypeScore:
+		criteria = opts.Levels
+	default:
+		// Options without guidance are sent as null, which the API takes as
+		// just the name.
+		options := make(map[string]any, len(opts.Options))
+		for name, guidance := range opts.Options {
+			if guidance == "" {
+				options[name] = nil
+			} else {
+				options[name] = guidance
+			}
+		}
+		criteria = options
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"model": opts.Model,
+		"state": opts.Input,
+		"questions": map[string]decisionQuestion{
+			"answer": {
+				Type:         opts.Type,
+				Instructions: opts.Question,
+				Criteria:     criteria,
+			},
+		},
+	})
+	if err != nil {
+		return provider.Decision{}, fmt.Errorf("failed to marshal decision request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", p.url, bytes.NewReader(body))
+	if err != nil {
+		return provider.Decision{}, fmt.Errorf("failed to create decision request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return provider.Decision{}, fmt.Errorf("failed to get decision: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var res struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&res)
+
+		// Problems with Kite's own key or credits are the operator's, not
+		// something the app's flow should show.
+		switch resp.StatusCode {
+		case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden:
+			slog.Error("OpenRouter rejected decision request", slog.Int("status", resp.StatusCode), slog.String("message", res.Error.Message))
+			return provider.Decision{}, errors.New("failed to get decision: AI is unavailable right now")
+		}
+		return provider.Decision{}, fmt.Errorf("failed to get decision: status %d: %s", resp.StatusCode, res.Error.Message)
+	}
+
+	var res struct {
+		Answers map[string]decisionAnswer `json:"answers"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1024*1024)).Decode(&res); err != nil {
+		return provider.Decision{}, fmt.Errorf("failed to decode decision: %w", err)
+	}
+
+	answer, ok := res.Answers["answer"]
+	if !ok {
+		return provider.Decision{}, errors.New("decision has no answer")
+	}
+
+	decision := provider.Decision{
+		Choice: answer.Choice,
+		Noul:   answer.Noul,
+		Score:  answer.Score,
+	}
+	if answer.Confidence != nil {
+		decision.Confidence = *answer.Confidence
+	} else {
+		decision.Confidence = answer.Probabilities[answer.Choice]
+	}
+	return decision, nil
+}
+
+// noDecisionProvider is used without an OpenRouter key. It fails, as a flow
+// shouldn't act on an answer no model gave.
+type noDecisionProvider struct{}
+
+func (noDecisionProvider) Decide(ctx context.Context, opts provider.DecideOpts) (provider.Decision, error) {
+	return provider.Decision{}, errors.New("AI decisions aren't configured")
 }
 
 // Variable IDs come from user-authored flow data, so lookups are scoped to the app.
 type VariableProvider struct {
 	appID              string
+	variableStore      store.VariableStore
 	variableValueStore store.VariableValueStore
+
+	// Whether each variable of the app is scoped, loaded the first time it's
+	// needed. The provider lives for one flow run.
+	mu     sync.Mutex
+	scoped map[string]bool
 }
 
-func NewVariableProvider(appID string, variableValueStore store.VariableValueStore) *VariableProvider {
+func NewVariableProvider(appID string, variableStore store.VariableStore, variableValueStore store.VariableValueStore) *VariableProvider {
 	return &VariableProvider{
 		appID:              appID,
+		variableStore:      variableStore,
 		variableValueStore: variableValueStore,
 	}
+}
+
+func (p *VariableProvider) VariableScoped(ctx context.Context, id string) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.scoped == nil {
+		variables, err := p.variableStore.VariablesByAppWithoutTotals(ctx, p.appID)
+		if err != nil {
+			return false, fmt.Errorf("failed to get variables: %w", err)
+		}
+
+		p.scoped = make(map[string]bool, len(variables))
+		for _, v := range variables {
+			p.scoped[v.ID] = v.Scoped
+		}
+	}
+
+	return p.scoped[id], nil
 }
 
 func (p *VariableProvider) UpdateVariable(ctx context.Context, id string, scope null.String, operation provider.VariableOperation, value thing.Thing) (thing.Thing, error) {
@@ -903,6 +1289,9 @@ func (p *RobloxProvider) UserByID(ctx context.Context, id int64) (*thing.RobloxU
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
 		return nil, provider.ErrNotFound
 	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, robloxError(resp, "failed to get roblox user")
+	}
 
 	var v thing.RobloxUserValue
 	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
@@ -938,6 +1327,10 @@ func (p *RobloxProvider) UsersByUsername(ctx context.Context, username string) (
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, robloxError(resp, "failed to get roblox users")
+	}
+
 	var v struct {
 		Data []thing.RobloxUserValue `json:"data"`
 	}
@@ -947,4 +1340,186 @@ func (p *RobloxProvider) UsersByUsername(ctx context.Context, username string) (
 	}
 
 	return v.Data, nil
+}
+
+func (p *RobloxProvider) UserAvatarURL(ctx context.Context, id int64) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=%d&size=150x150&format=Png", id), nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create roblox avatar request: %w", err)
+	}
+
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to get roblox avatar: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", robloxError(resp, "failed to get roblox avatar")
+	}
+
+	var v struct {
+		Data []struct {
+			State    string `json:"state"`
+			ImageURL string `json:"imageUrl"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		return "", fmt.Errorf("failed to decode roblox avatar: %w", err)
+	}
+
+	// Avatars that are blocked or still rendering have no usable image.
+	if len(v.Data) == 0 || v.Data[0].State != "Completed" {
+		return "", nil
+	}
+	return v.Data[0].ImageURL, nil
+}
+
+// robloxError reads the error of a failed Roblox request. Without it, the
+// error body decodes into an empty user.
+func robloxError(resp *http.Response, msg string) error {
+	if resp.StatusCode == http.StatusTooManyRequests {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
+		return fmt.Errorf("%s: Roblox is rate limiting requests, try again later", msg)
+	}
+
+	var res struct {
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&res)
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
+	if len(res.Errors) > 0 && res.Errors[0].Message != "" {
+		return fmt.Errorf("%s: status %d: %s", msg, resp.StatusCode, res.Errors[0].Message)
+	}
+	return fmt.Errorf("%s: status %d", msg, resp.StatusCode)
+}
+
+type SecretProvider struct {
+	appID          string
+	appSecretStore store.AppSecretStore
+	tokenCrypt     *util.SymmetricCrypt
+
+	// Decrypted secrets, as a flow can send the same request many times.
+	mu     sync.Mutex
+	values map[string]string
+}
+
+func NewSecretProvider(appID string, appSecretStore store.AppSecretStore, tokenCrypt *util.SymmetricCrypt) *SecretProvider {
+	return &SecretProvider{
+		appID:          appID,
+		appSecretStore: appSecretStore,
+		tokenCrypt:     tokenCrypt,
+	}
+}
+
+// Secrets only decrypts the secrets a flow uses.
+func (p *SecretProvider) Secrets(ctx context.Context, names []string) (map[string]string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	var missing []string
+	for _, name := range names {
+		if _, ok := p.values[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+
+	if len(missing) > 0 {
+		secrets, err := p.appSecretStore.AppSecretsByNames(ctx, p.appID, missing)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get secrets: %w", err)
+		}
+
+		if p.values == nil {
+			p.values = make(map[string]string, len(secrets))
+		}
+		for _, secret := range secrets {
+			value, err := p.tokenCrypt.DecryptString(secret.ValueEncrypted)
+			if err != nil {
+				return nil, fmt.Errorf("failed to decrypt secret %s: %w", secret.Name, err)
+			}
+			p.values[secret.Name] = value
+		}
+	}
+
+	res := make(map[string]string, len(names))
+	for _, name := range names {
+		if value, ok := p.values[name]; ok {
+			res[name] = value
+		}
+	}
+	return res, nil
+}
+
+type IntegrationProvider struct {
+	appID               string
+	appSecretStore      store.AppSecretStore
+	appIntegrationStore store.AppIntegrationStore
+	tokenCrypt          *util.SymmetricCrypt
+
+	// Loaded once per run, as blocks in loops need them again and again.
+	mu          sync.Mutex
+	choices     map[string]bool
+	credentials map[string]string
+}
+
+func NewIntegrationProvider(appID string, appSecretStore store.AppSecretStore, appIntegrationStore store.AppIntegrationStore, tokenCrypt *util.SymmetricCrypt) *IntegrationProvider {
+	return &IntegrationProvider{
+		appID:               appID,
+		appSecretStore:      appSecretStore,
+		appIntegrationStore: appIntegrationStore,
+		tokenCrypt:          tokenCrypt,
+	}
+}
+
+func (p *IntegrationProvider) Choice(ctx context.Context, integrationID string) (null.Bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.choices == nil {
+		rows, err := p.appIntegrationStore.AppIntegrations(ctx, p.appID)
+		if err != nil {
+			return null.Bool{}, fmt.Errorf("failed to get integrations: %w", err)
+		}
+		p.choices = make(map[string]bool, len(rows))
+		for _, row := range rows {
+			p.choices[row.IntegrationID] = row.Enabled
+		}
+	}
+
+	enabled, ok := p.choices[integrationID]
+	return null.NewBool(enabled, ok), nil
+}
+
+func (p *IntegrationProvider) Credential(ctx context.Context, integrationID string) (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if value, ok := p.credentials[integrationID]; ok {
+		return value, nil
+	}
+
+	secret, err := p.appSecretStore.AppIntegrationCredential(ctx, p.appID, integrationID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return "", provider.ErrNotFound
+		}
+		return "", fmt.Errorf("failed to get credential: %w", err)
+	}
+
+	value, err := p.tokenCrypt.DecryptString(secret.ValueEncrypted)
+	if err != nil {
+		return "", fmt.Errorf("failed to decrypt credential: %w", err)
+	}
+
+	if p.credentials == nil {
+		p.credentials = map[string]string{}
+	}
+	p.credentials[integrationID] = value
+	return value, nil
 }

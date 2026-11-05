@@ -1,6 +1,7 @@
 package thing
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -244,6 +245,27 @@ func NewGuessTypeWithFallback(v any) Thing {
 	return res
 }
 
+// NewFromJSONValue wraps a value decoded from JSON, turning its objects and
+// arrays into things too so they can be stored and read like other results.
+func NewFromJSONValue(v any) Thing {
+	switch v := v.(type) {
+	case map[string]any:
+		res := make(map[string]Thing, len(v))
+		for key, item := range v {
+			res[key] = NewFromJSONValue(item)
+		}
+		return NewObject(res)
+	case []any:
+		res := make([]Thing, len(v))
+		for i, item := range v {
+			res[i] = NewFromJSONValue(item)
+		}
+		return NewArray(res)
+	default:
+		return NewGuessTypeWithFallback(v)
+	}
+}
+
 func NewString(v string) Thing {
 	return Thing{
 		Type:  TypeString,
@@ -388,6 +410,64 @@ func (w Thing) String() string {
 		return fmt.Sprintf("%v", w.Value)
 	default:
 		return fmt.Sprintf("%v", w.Value)
+	}
+}
+
+// IsDiscordEntity reports whether the thing is a Discord object with an ID,
+// like a user or channel.
+func (w Thing) IsDiscordEntity() bool {
+	switch w.Type {
+	case TypeDiscordMessage, TypeDiscordUser, TypeDiscordMember,
+		TypeDiscordChannel, TypeDiscordGuild, TypeDiscordRole:
+		return true
+	}
+	return false
+}
+
+// JSONValue returns the thing as a value that can be encoded as JSON. Discord
+// objects become their ID and other types their string form.
+func (w Thing) JSONValue() any {
+	if w.IsDiscordEntity() {
+		return w.Snowflake().String()
+	}
+
+	switch v := w.Value.(type) {
+	case nil, string, int64, float64, bool:
+		return v
+	case []Thing:
+		res := make([]any, len(v))
+		for i, item := range v {
+			res[i] = item.JSONValue()
+		}
+		return res
+	case map[string]Thing:
+		res := make(map[string]any, len(v))
+		for key, item := range v {
+			res[key] = item.JSONValue()
+		}
+		return res
+	// Lists and maps built in expressions, like {{[1, 2]}}, and ones of the
+	// placeholder env, like []string, aren't wrapped.
+	case []byte:
+		return string(v)
+	}
+
+	rv := reflect.ValueOf(w.Value)
+	switch {
+	case rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array:
+		res := make([]any, rv.Len())
+		for i := range res {
+			res[i] = NewGuessTypeWithFallback(rv.Index(i).Interface()).JSONValue()
+		}
+		return res
+	case rv.Kind() == reflect.Map && rv.Type().Key().Kind() == reflect.String:
+		res := make(map[string]any, rv.Len())
+		for iter := rv.MapRange(); iter.Next(); {
+			res[iter.Key().String()] = NewGuessTypeWithFallback(iter.Value().Interface()).JSONValue()
+		}
+		return res
+	default:
+		return w.String()
 	}
 }
 
@@ -626,7 +706,90 @@ func (w Thing) HTTPResponse() HTTPResponseValue {
 }
 
 func (w Thing) Equals(other *Thing) bool {
+	a, aText := w.Value.(string)
+	b, bText := other.Value.(string)
+	_, aBool := w.Value.(bool)
+	_, bBool := other.Value.(bool)
+	aNumber, aIsNumber := w.number()
+	bNumber, bIsNumber := other.number()
+
+	// Text typed into a condition, like 5 or true, can only be text, so it's
+	// read as a number or as yes or no to compare it with one.
+	switch {
+	case aText && bText:
+		// In constant time, as the text can be a secret or token.
+		return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+	case aText && bIsNumber:
+		return textEqualsNumber(a, bNumber)
+	case bText && aIsNumber:
+		return textEqualsNumber(b, aNumber)
+	case aText && bBool:
+		yes, ok := ParseYesNo(a)
+		return ok && yes == other.Value.(bool)
+	case bText && aBool:
+		yes, ok := ParseYesNo(b)
+		return ok && yes == w.Value.(bool)
+	case aIsNumber && bIsNumber:
+		return numbersEqual(aNumber, bNumber)
+	}
 	return reflect.DeepEqual(w.Value, other.Value)
+}
+
+// ParseYesNo reads text like true, yes or 1, and false, no or 0, in any case,
+// like the value of a variable or a select menu option.
+func ParseYesNo(s string) (value bool, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "true", "yes", "1":
+		return true, true
+	case "false", "no", "0":
+		return false, true
+	}
+	return false, false
+}
+
+// number returns w as an int64 or float64, whatever its Type, as values like
+// results restored from JSON have TypeAny.
+func (w Thing) number() (any, bool) {
+	switch v := w.Value.(type) {
+	case int:
+		return int64(v), true
+	case int32:
+		return int64(v), true
+	case int64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case float64:
+		return v, true
+	}
+	return nil, false
+}
+
+// numbersEqual compares two results of number, ints exactly, as large ones
+// like IDs don't fit a float64.
+func numbersEqual(a, b any) bool {
+	aInt, aOK := a.(int64)
+	bInt, bOK := b.(int64)
+	if aOK && bOK {
+		return aInt == bInt
+	}
+	return toFloat(a) == toFloat(b)
+}
+
+func toFloat(n any) float64 {
+	if i, ok := n.(int64); ok {
+		return float64(i)
+	}
+	return n.(float64)
+}
+
+func textEqualsNumber(text string, n any) bool {
+	text = strings.TrimSpace(text)
+	if i, err := strconv.ParseInt(text, 10, 64); err == nil {
+		return numbersEqual(i, n)
+	}
+	f, err := strconv.ParseFloat(text, 64)
+	return err == nil && numbersEqual(f, n)
 }
 
 func (w Thing) GreaterThan(other *Thing) bool {

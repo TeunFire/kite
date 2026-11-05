@@ -31,9 +31,8 @@ After creating your app in Discord, it's now time to add it to Kite.
 
 Open the [Kite dashboard](https://kite.onl/apps) and sign-in with your Discord account. This is where you will add your app, manage commands, and more.
 
-1. Click on `Create app` at the bottom
-2. Fill in the bot token and click on `Create app`
-3. Click on `Open app` next to the app's name
+1. Click on `Create app`
+2. Fill in the bot token and click on `Create app`. Kite opens the dashboard of your new app.
 
 You have now added your app to Kite and are ready to create your first command!
 
@@ -50,10 +49,13 @@ Just click on `Invite app` at top-right of the dashboard's overview page and sel
 3. In the no-code editor drag in a `Create response message` block from the block explorer on the left side
 4. Connect it to the command block by dragging your mouse from the blue dot of one block to the other
 5. Click on the `Create response message` block and type in some text for the response
-6. Save the command by clicking on `Save Changes` at the top
-7. Click the `Deploy` button at the top to update your bot and apply your changes.
+6. Save the command by clicking on `Save Changes` at the top. Kite adds it to Discord a few seconds later.
 
-![Example Flow](./img/example-flow.png)
+![Example Flow](./img/example-flow.webp)
+
+### Saving and History
+
+Click `History` at the top right to see the last 25 saves of a command, event listener or message template. `Undo save` goes back to the save before the current one, and pressing it again goes further back. `Restore` brings back any earlier save. A restore is saved as a new version, so you can undo it the same way. Template updates are kept in the history too.
 
 It's time to try it out inside Discord!
 
@@ -67,6 +69,8 @@ It can take up to a minute for your new command to appear inside Discord. Make s
 4. Save the message by clicking on `Save Changes` at the top
 5. Click on `Send Message` to send the message to a channel that your app has access to
 
-![Example Message](./img/example-message.png)
+To start a new forum post with the message, switch to the `Forum Post` tab in the same dialog and pick a forum or media channel. Enter a title for the post, choose up to 5 of the channel's tags, and click on `Create Post`. The message becomes the first message of the post, and you can still update it later from the same dialog.
+
+![Example Message](./img/example-message.webp)
 
 You can also use the newly created message template as a response to your previously created command!

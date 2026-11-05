@@ -35,30 +35,32 @@ INSERT INTO event_listeners (
     description,
     enabled,
     app_id,
-    module_id,
+    bundle_install_id,
     creator_user_id,
     filter,
     flow_source,
     created_at,
-    updated_at
+    updated_at,
+    webhook_secret
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
-) RETURNING id, source, type, description, enabled, app_id, module_id, creator_user_id, filter, flow_source, created_at, updated_at, last_run_at
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+) RETURNING id, source, type, description, enabled, app_id, bundle_install_id, creator_user_id, filter, flow_source, created_at, updated_at, last_run_at, webhook_secret
 `
 
 type CreateEventListenerParams struct {
-	ID            string
-	Source        string
-	Type          string
-	Description   string
-	Enabled       bool
-	AppID         string
-	ModuleID      pgtype.Text
-	CreatorUserID string
-	Filter        []byte
-	FlowSource    []byte
-	CreatedAt     pgtype.Timestamp
-	UpdatedAt     pgtype.Timestamp
+	ID              string
+	Source          string
+	Type            string
+	Description     string
+	Enabled         bool
+	AppID           string
+	BundleInstallID pgtype.Text
+	CreatorUserID   string
+	Filter          []byte
+	FlowSource      []byte
+	CreatedAt       pgtype.Timestamp
+	UpdatedAt       pgtype.Timestamp
+	WebhookSecret   pgtype.Text
 }
 
 func (q *Queries) CreateEventListener(ctx context.Context, arg CreateEventListenerParams) (EventListener, error) {
@@ -69,12 +71,13 @@ func (q *Queries) CreateEventListener(ctx context.Context, arg CreateEventListen
 		arg.Description,
 		arg.Enabled,
 		arg.AppID,
-		arg.ModuleID,
+		arg.BundleInstallID,
 		arg.CreatorUserID,
 		arg.Filter,
 		arg.FlowSource,
 		arg.CreatedAt,
 		arg.UpdatedAt,
+		arg.WebhookSecret,
 	)
 	var i EventListener
 	err := row.Scan(
@@ -84,24 +87,81 @@ func (q *Queries) CreateEventListener(ctx context.Context, arg CreateEventListen
 		&i.Description,
 		&i.Enabled,
 		&i.AppID,
-		&i.ModuleID,
+		&i.BundleInstallID,
 		&i.CreatorUserID,
 		&i.Filter,
 		&i.FlowSource,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.LastRunAt,
+		&i.WebhookSecret,
 	)
 	return i, err
 }
 
-const deleteEventListener = `-- name: DeleteEventListener :exec
-DELETE FROM event_listeners WHERE id = $1
+const deleteEventListener = `-- name: DeleteEventListener :one
+DELETE FROM event_listeners WHERE id = $1 RETURNING id, source, type, description, enabled, app_id, bundle_install_id, creator_user_id, filter, flow_source, created_at, updated_at, last_run_at, webhook_secret
 `
 
-func (q *Queries) DeleteEventListener(ctx context.Context, id string) error {
-	_, err := q.db.Exec(ctx, deleteEventListener, id)
-	return err
+func (q *Queries) DeleteEventListener(ctx context.Context, id string) (EventListener, error) {
+	row := q.db.QueryRow(ctx, deleteEventListener, id)
+	var i EventListener
+	err := row.Scan(
+		&i.ID,
+		&i.Source,
+		&i.Type,
+		&i.Description,
+		&i.Enabled,
+		&i.AppID,
+		&i.BundleInstallID,
+		&i.CreatorUserID,
+		&i.Filter,
+		&i.FlowSource,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.LastRunAt,
+		&i.WebhookSecret,
+	)
+	return i, err
+}
+
+const deleteEventListenersByBundleInstall = `-- name: DeleteEventListenersByBundleInstall :many
+DELETE FROM event_listeners WHERE bundle_install_id = $1 RETURNING id, source, type, description, enabled, app_id, bundle_install_id, creator_user_id, filter, flow_source, created_at, updated_at, last_run_at, webhook_secret
+`
+
+func (q *Queries) DeleteEventListenersByBundleInstall(ctx context.Context, bundleInstallID pgtype.Text) ([]EventListener, error) {
+	rows, err := q.db.Query(ctx, deleteEventListenersByBundleInstall, bundleInstallID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []EventListener
+	for rows.Next() {
+		var i EventListener
+		if err := rows.Scan(
+			&i.ID,
+			&i.Source,
+			&i.Type,
+			&i.Description,
+			&i.Enabled,
+			&i.AppID,
+			&i.BundleInstallID,
+			&i.CreatorUserID,
+			&i.Filter,
+			&i.FlowSource,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.LastRunAt,
+			&i.WebhookSecret,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const getEnabledEventListenerIDs = `-- name: GetEnabledEventListenerIDs :many
@@ -153,7 +213,7 @@ func (q *Queries) GetEnabledScheduledEventListenerIDs(ctx context.Context) ([]st
 }
 
 const getEventListener = `-- name: GetEventListener :one
-SELECT id, source, type, description, enabled, app_id, module_id, creator_user_id, filter, flow_source, created_at, updated_at, last_run_at FROM event_listeners WHERE id = $1
+SELECT id, source, type, description, enabled, app_id, bundle_install_id, creator_user_id, filter, flow_source, created_at, updated_at, last_run_at, webhook_secret FROM event_listeners WHERE id = $1
 `
 
 func (q *Queries) GetEventListener(ctx context.Context, id string) (EventListener, error) {
@@ -166,19 +226,46 @@ func (q *Queries) GetEventListener(ctx context.Context, id string) (EventListene
 		&i.Description,
 		&i.Enabled,
 		&i.AppID,
-		&i.ModuleID,
+		&i.BundleInstallID,
 		&i.CreatorUserID,
 		&i.Filter,
 		&i.FlowSource,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.LastRunAt,
+		&i.WebhookSecret,
+	)
+	return i, err
+}
+
+const getEventListenerForUpdate = `-- name: GetEventListenerForUpdate :one
+SELECT id, source, type, description, enabled, app_id, bundle_install_id, creator_user_id, filter, flow_source, created_at, updated_at, last_run_at, webhook_secret FROM event_listeners WHERE id = $1 FOR UPDATE
+`
+
+func (q *Queries) GetEventListenerForUpdate(ctx context.Context, id string) (EventListener, error) {
+	row := q.db.QueryRow(ctx, getEventListenerForUpdate, id)
+	var i EventListener
+	err := row.Scan(
+		&i.ID,
+		&i.Source,
+		&i.Type,
+		&i.Description,
+		&i.Enabled,
+		&i.AppID,
+		&i.BundleInstallID,
+		&i.CreatorUserID,
+		&i.Filter,
+		&i.FlowSource,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.LastRunAt,
+		&i.WebhookSecret,
 	)
 	return i, err
 }
 
 const getEventListenersByApp = `-- name: GetEventListenersByApp :many
-SELECT id, source, type, description, enabled, app_id, module_id, creator_user_id, filter, flow_source, created_at, updated_at, last_run_at FROM event_listeners WHERE app_id = $1 ORDER BY created_at DESC
+SELECT id, source, type, description, enabled, app_id, bundle_install_id, creator_user_id, filter, flow_source, created_at, updated_at, last_run_at, webhook_secret FROM event_listeners WHERE app_id = $1 ORDER BY created_at DESC
 `
 
 func (q *Queries) GetEventListenersByApp(ctx context.Context, appID string) ([]EventListener, error) {
@@ -197,13 +284,14 @@ func (q *Queries) GetEventListenersByApp(ctx context.Context, appID string) ([]E
 			&i.Description,
 			&i.Enabled,
 			&i.AppID,
-			&i.ModuleID,
+			&i.BundleInstallID,
 			&i.CreatorUserID,
 			&i.Filter,
 			&i.FlowSource,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.LastRunAt,
+			&i.WebhookSecret,
 		); err != nil {
 			return nil, err
 		}
@@ -216,7 +304,7 @@ func (q *Queries) GetEventListenersByApp(ctx context.Context, appID string) ([]E
 }
 
 const getEventListenersUpdatedSince = `-- name: GetEventListenersUpdatedSince :many
-SELECT id, source, type, description, enabled, app_id, module_id, creator_user_id, filter, flow_source, created_at, updated_at, last_run_at FROM event_listeners WHERE updated_at > $1 AND (enabled = TRUE OR $2::BOOLEAN)
+SELECT id, source, type, description, enabled, app_id, bundle_install_id, creator_user_id, filter, flow_source, created_at, updated_at, last_run_at, webhook_secret FROM event_listeners WHERE updated_at > $1 AND (enabled = TRUE OR $2::BOOLEAN)
 `
 
 type GetEventListenersUpdatedSinceParams struct {
@@ -242,13 +330,14 @@ func (q *Queries) GetEventListenersUpdatedSince(ctx context.Context, arg GetEven
 			&i.Description,
 			&i.Enabled,
 			&i.AppID,
-			&i.ModuleID,
+			&i.BundleInstallID,
 			&i.CreatorUserID,
 			&i.Filter,
 			&i.FlowSource,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.LastRunAt,
+			&i.WebhookSecret,
 		); err != nil {
 			return nil, err
 		}
@@ -262,18 +351,16 @@ func (q *Queries) GetEventListenersUpdatedSince(ctx context.Context, arg GetEven
 
 const updateEventListener = `-- name: UpdateEventListener :one
 UPDATE event_listeners SET
-    enabled = $2,
-    type = $3,
-    filter = $4,
-    description = $5,
-    flow_source = $6,
-    updated_at = $7
-WHERE id = $1 RETURNING id, source, type, description, enabled, app_id, module_id, creator_user_id, filter, flow_source, created_at, updated_at, last_run_at
+    type = $2,
+    filter = $3,
+    description = $4,
+    flow_source = $5,
+    updated_at = $6
+WHERE id = $1 RETURNING id, source, type, description, enabled, app_id, bundle_install_id, creator_user_id, filter, flow_source, created_at, updated_at, last_run_at, webhook_secret
 `
 
 type UpdateEventListenerParams struct {
 	ID          string
-	Enabled     bool
 	Type        string
 	Filter      []byte
 	Description string
@@ -284,7 +371,6 @@ type UpdateEventListenerParams struct {
 func (q *Queries) UpdateEventListener(ctx context.Context, arg UpdateEventListenerParams) (EventListener, error) {
 	row := q.db.QueryRow(ctx, updateEventListener,
 		arg.ID,
-		arg.Enabled,
 		arg.Type,
 		arg.Filter,
 		arg.Description,
@@ -299,13 +385,84 @@ func (q *Queries) UpdateEventListener(ctx context.Context, arg UpdateEventListen
 		&i.Description,
 		&i.Enabled,
 		&i.AppID,
-		&i.ModuleID,
+		&i.BundleInstallID,
 		&i.CreatorUserID,
 		&i.Filter,
 		&i.FlowSource,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.LastRunAt,
+		&i.WebhookSecret,
+	)
+	return i, err
+}
+
+const updateEventListenerEnabled = `-- name: UpdateEventListenerEnabled :one
+UPDATE event_listeners SET
+    enabled = $2,
+    updated_at = $3
+WHERE id = $1 RETURNING id, source, type, description, enabled, app_id, bundle_install_id, creator_user_id, filter, flow_source, created_at, updated_at, last_run_at, webhook_secret
+`
+
+type UpdateEventListenerEnabledParams struct {
+	ID        string
+	Enabled   bool
+	UpdatedAt pgtype.Timestamp
+}
+
+func (q *Queries) UpdateEventListenerEnabled(ctx context.Context, arg UpdateEventListenerEnabledParams) (EventListener, error) {
+	row := q.db.QueryRow(ctx, updateEventListenerEnabled, arg.ID, arg.Enabled, arg.UpdatedAt)
+	var i EventListener
+	err := row.Scan(
+		&i.ID,
+		&i.Source,
+		&i.Type,
+		&i.Description,
+		&i.Enabled,
+		&i.AppID,
+		&i.BundleInstallID,
+		&i.CreatorUserID,
+		&i.Filter,
+		&i.FlowSource,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.LastRunAt,
+		&i.WebhookSecret,
+	)
+	return i, err
+}
+
+const updateEventListenerWebhookSecret = `-- name: UpdateEventListenerWebhookSecret :one
+UPDATE event_listeners SET
+    webhook_secret = $2,
+    updated_at = $3
+WHERE id = $1 RETURNING id, source, type, description, enabled, app_id, bundle_install_id, creator_user_id, filter, flow_source, created_at, updated_at, last_run_at, webhook_secret
+`
+
+type UpdateEventListenerWebhookSecretParams struct {
+	ID            string
+	WebhookSecret pgtype.Text
+	UpdatedAt     pgtype.Timestamp
+}
+
+func (q *Queries) UpdateEventListenerWebhookSecret(ctx context.Context, arg UpdateEventListenerWebhookSecretParams) (EventListener, error) {
+	row := q.db.QueryRow(ctx, updateEventListenerWebhookSecret, arg.ID, arg.WebhookSecret, arg.UpdatedAt)
+	var i EventListener
+	err := row.Scan(
+		&i.ID,
+		&i.Source,
+		&i.Type,
+		&i.Description,
+		&i.Enabled,
+		&i.AppID,
+		&i.BundleInstallID,
+		&i.CreatorUserID,
+		&i.Filter,
+		&i.FlowSource,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.LastRunAt,
+		&i.WebhookSecret,
 	)
 	return i, err
 }

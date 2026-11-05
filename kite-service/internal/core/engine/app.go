@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/kitecloud/kite/kite-service/internal/model"
 	"github.com/kitecloud/kite/kite-service/internal/store"
 	"github.com/kitecloud/kite/kite-service/pkg/flow"
+	"github.com/kitecloud/kite/kite-service/pkg/guildevent"
 	"github.com/kitecloud/kite/kite-service/pkg/message"
 )
 
@@ -68,8 +70,8 @@ func (a *App) rebuildCommandIndex() {
 }
 
 // rebuildListenerIndex regenerates the event type lookup of Discord listeners
-// and the list of scheduled listeners from a.listeners. Callers must hold the
-// write lock.
+// and the list of scheduled listeners from a.listeners. Webhook listeners are
+// looked up by ID and need no index. Callers must hold the write lock.
 func (a *App) rebuildListenerIndex() {
 	index := make(map[model.EventListenerType][]*EventListener, len(a.listeners))
 	var scheduled []*EventListener
@@ -329,18 +331,75 @@ func (a *App) HandleEvent(appID string, session *state.State, event gateway.Even
 			a.resumeFlowOrRespondExpired(resumePointID, session, e)
 		}
 	default:
-		eventType := model.EventTypeFromDiscordEventType(e.EventType())
-
-		// The index is replaced rather than mutated on rebuild, so this slice
-		// stays valid after the lock is released.
-		a.RLock()
-		listeners := a.listenersByType[eventType]
-		a.RUnlock()
-
+		listeners := a.listenersForEvent(event)
+		// Listeners get Discord's event, so stored triggers and flows don't
+		// need to know MessageEdit.
+		if e, ok := event.(*guildevent.MessageEdit); ok {
+			event = &e.MessageUpdateEvent
+		}
 		for _, listener := range listeners {
 			go listener.HandleEvent(appID, session, event)
 		}
 	}
+}
+
+// listenersForEvent returns the event listeners an event is dispatched to.
+// Messages in DMs only go to direct message listeners: message listeners
+// were written for servers, and running them, and spending credits, on every
+// DM once an app has the direct messages intent would change what existing
+// flows do. A boost system message is a MESSAGE_CREATE, so it also goes to the
+// boost listeners on top of the message create ones. Discord's MESSAGE_DELETE
+// goes to no listeners, they get guildevent.MessageDelete instead, which has
+// the same type. The same goes for MESSAGE_UPDATE and guildevent.MessageEdit,
+// so link previews and pins don't run Message Update listeners.
+func (a *App) listenersForEvent(event gateway.Event) []*EventListener {
+	switch event.(type) {
+	case *gateway.MessageDeleteEvent, *gateway.MessageUpdateEvent:
+		return nil
+	}
+
+	eventType := model.EventTypeFromDiscordEventType(event.EventType())
+
+	if isDirectMessageEvent(event) {
+		if _, ok := event.(*gateway.MessageCreateEvent); !ok {
+			return nil
+		}
+		eventType = model.EventListenerTypeDiscordDirectMessageCreate
+	}
+
+	// The index is replaced rather than mutated on rebuild, so this slice
+	// stays valid after the lock is released.
+	a.RLock()
+	defer a.RUnlock()
+
+	listeners := a.listenersByType[eventType]
+
+	if e, ok := event.(*gateway.MessageCreateEvent); ok && isBoostMessage(e.Message) {
+		boostListeners := a.listenersByType[model.EventListenerTypeDiscordGuildBoost]
+		if len(boostListeners) > 0 {
+			// Clip so the append can't write into the index's backing array.
+			listeners = append(slices.Clip(listeners), boostListeners...)
+		}
+	}
+
+	return listeners
+}
+
+// isDirectMessageEvent reports whether an event is a message create, update
+// or delete in a DM.
+func isDirectMessageEvent(event gateway.Event) bool {
+	switch e := event.(type) {
+	case *gateway.MessageCreateEvent:
+		return e.GuildID == 0
+	case *gateway.MessageUpdateEvent:
+		return e.GuildID == 0
+	case *guildevent.MessageEdit:
+		return e.GuildID == 0
+	case *gateway.MessageDeleteEvent:
+		return e.GuildID == 0
+	}
+
+	return false
 }
 
 // resumeFlow loads a resume point and dispatches it back into the flow that

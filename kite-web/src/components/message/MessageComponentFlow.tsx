@@ -3,21 +3,12 @@ import { useShallow } from "zustand/react/shallow";
 import { FlowData } from "@/lib/flow/dataSchema";
 import { FlowContextType } from "@/lib/flow/context";
 import { useCurrentFlow } from "@/lib/message/state";
-import { getUniqueId } from "@/lib/utils";
+import { newComponentFlow } from "@/lib/flow/newFlows";
 import FlowDialog from "../flow/FlowDialog";
 import FlowPreview from "../flow/FlowPreview";
+import { useMessageId } from "@/lib/hooks/params";
 
-const initialFlow = {
-  nodes: [
-    {
-      id: getUniqueId().toString(),
-      position: { x: 0, y: 0 },
-      data: {},
-      type: "entry_component_button",
-    },
-  ],
-  edges: [],
-};
+const initialFlow = newComponentFlow();
 
 /**
  * The flow a button or select menu triggers, edited in a dialog. Memoized
@@ -40,10 +31,14 @@ export default memo(function MessageComponentFlow({
     [replaceFlow, flowSourceId]
   );
 
+  const messageId = useMessageId();
+
   return (
     <FlowDialog
       flowData={flowData || initialFlow}
+      logFilter={{ messageId }}
       context={context}
+      viewportKey={`component:${messageId}:${flowSourceId}`}
       onClose={onClose}
     >
       <FlowPreview

@@ -1,12 +1,15 @@
 import { useRouter } from "next/router";
 import { useEffect } from "react";
 import {
+  useAppCollaboratorInvitesQuery,
   useAppCollaboratorsQuery,
   useAppEmojisQuery,
   useAppEntitiesQuery,
   useAppQuery,
   useAppsQuery,
   useAppStateGuildChannelsQuery,
+  useAppStateGuildRolesQuery,
+  useAppStateEmojisQuery,
   useAppStateGuildsQuery,
   useAppSubscriptionsQuery,
   useBillingPlansQuery,
@@ -14,7 +17,15 @@ import {
   useCommandsQuery,
   useEventListenerQuery,
   useEventListenersQuery,
+  useBundleInstallsQuery,
+  useOpenBundleReportsQuery,
+  useUserBansQuery,
+  usePendingBundleReviewsQuery,
+  useAutoRejectedBundleReviewsQuery,
+  useUserBundlesQuery,
   useAppFeaturesQuery,
+  useFlowAIUsageQuery,
+  useLogEntriesQuery,
   useLogSummaryQuery,
   useMessageInstancesQuery,
   useMessageQuery,
@@ -25,12 +36,15 @@ import {
   useUserQuery,
   useVariableQuery,
   useVariablesQuery,
+  useAppSecretsQuery,
+  useAppIntegrationsQuery,
   usePluginsQuery,
   usePluginInstanceQuery,
   usePluginInstancesQuery,
 } from "../api/queries";
 import { APIResponse } from "../api/response";
 import {
+  AppCollaboratorInviteListResponse,
   AppCollaboratorListResponse,
   AppEmojiListResponse,
   AppEntityListResponse,
@@ -41,7 +55,10 @@ import {
   CommandListResponse,
   EventListenerGetResponse,
   EventListenerListResponse,
+  BundleInstallListResponse,
+  UserBundleListResponse,
   FeaturesGetResponse,
+  FlowAIUsageGetResponse,
   LogSummaryGetResponse,
   MessageGetResponse,
   MessageInstanceListResponse,
@@ -50,6 +67,8 @@ import {
   PluginInstanceListResponse,
   PluginListResponse,
   StateGuildChannelListResponse,
+  StateGuildRoleListResponse,
+  StateEmojiListResponse,
   StateGuildListResponse,
   SubscriptionListResponse,
   UsageByDayListResponse,
@@ -58,6 +77,8 @@ import {
   UserGetResponse,
   VariableGetResponse,
   VariableListResponse,
+  AppSecretListResponse,
+  AppIntegrationListResponse,
 } from "../types/wire.gen";
 import { useAppId, usePluginId } from "./params";
 
@@ -138,6 +159,38 @@ export function useCommand(
   return useResponseData(query, callback);
 }
 
+export function usePendingBundleReviews() {
+  return useResponseData(usePendingBundleReviewsQuery());
+}
+
+export function useAutoRejectedBundleReviews() {
+  return useResponseData(useAutoRejectedBundleReviewsQuery());
+}
+
+export function useOpenBundleReports() {
+  return useResponseData(useOpenBundleReportsQuery());
+}
+
+export function useUserBans() {
+  return useResponseData(useUserBansQuery());
+}
+
+export function useUserBundles(
+  callback?: (res: APIResponse<UserBundleListResponse>) => void
+) {
+  const query = useUserBundlesQuery();
+  return useResponseData(query, callback);
+}
+
+export function useBundleInstalls(
+  callback?: (res: APIResponse<BundleInstallListResponse>) => void
+) {
+  const router = useRouter();
+
+  const query = useBundleInstallsQuery(router.query.appId as string);
+  return useResponseData(query, callback);
+}
+
 export function useEventListeners(
   callback?: (res: APIResponse<EventListenerListResponse>) => void
 ) {
@@ -165,6 +218,24 @@ export function useVariables(
   const router = useRouter();
 
   const query = useVariablesQuery(router.query.appId as string);
+  return useResponseData(query, callback);
+}
+
+export function useAppIntegrations(
+  callback?: (res: APIResponse<AppIntegrationListResponse>) => void
+) {
+  const router = useRouter();
+
+  const query = useAppIntegrationsQuery(router.query.appId as string);
+  return useResponseData(query, callback);
+}
+
+export function useAppSecrets(
+  callback?: (res: APIResponse<AppSecretListResponse>) => void
+) {
+  const router = useRouter();
+
+  const query = useAppSecretsQuery(router.query.appId as string);
   return useResponseData(query, callback);
 }
 
@@ -270,6 +341,27 @@ export function useAppStateGuild(guildId: string | null) {
   return data?.find((g) => g!.id === guildId);
 }
 
+export function useAppStateEmojis(
+  callback?: (res: APIResponse<StateEmojiListResponse>) => void
+) {
+  const router = useRouter();
+  const query = useAppStateEmojisQuery(router.query.appId as string);
+  return useResponseData(query, callback);
+}
+
+export function useAppStateGuildRoles(
+  guildId: string | null,
+  callback?: (res: APIResponse<StateGuildRoleListResponse>) => void
+) {
+  const router = useRouter();
+
+  const query = useAppStateGuildRolesQuery(
+    router.query.appId as string,
+    guildId
+  );
+  return useResponseData(query, callback);
+}
+
 export function useAppStateGuildChannels(
   guildId: string | null,
   callback?: (res: APIResponse<StateGuildChannelListResponse>) => void
@@ -307,6 +399,15 @@ export function useAppCollaborators(
   return useResponseData(query, callback);
 }
 
+export function useAppCollaboratorInvites(
+  callback?: (res: APIResponse<AppCollaboratorInviteListResponse>) => void
+) {
+  const router = useRouter();
+
+  const query = useAppCollaboratorInvitesQuery(router.query.appId as string);
+  return useResponseData(query, callback);
+}
+
 export function useAppSubscriptions(
   callback?: (res: APIResponse<SubscriptionListResponse>) => void
 ) {
@@ -320,6 +421,13 @@ export function useBillingPlans(
   callback?: (res: APIResponse<BillingPlanListResponse>) => void
 ) {
   const query = useBillingPlansQuery();
+  return useResponseData(query, callback);
+}
+
+export function useFlowAIUsage(
+  callback?: (res: APIResponse<FlowAIUsageGetResponse>) => void
+) {
+  const query = useFlowAIUsageQuery(useAppId());
   return useResponseData(query, callback);
 }
 
@@ -383,4 +491,22 @@ export function usePluginInstance(
 ) {
   const query = usePluginInstanceQuery(useAppId(), usePluginId());
   return useResponseData(query, callback);
+}
+
+export interface FlowLogEntriesFilter {
+  commandId?: string;
+  eventId?: string;
+  messageId?: string;
+}
+
+// The latest runs of a flow, shown in the flow editor.
+export function useFlowLogEntries(filter: FlowLogEntriesFilter) {
+  const query = useLogEntriesQuery(useAppId(), {
+    ...filter,
+    limit: 10,
+    refetchInterval: 10000,
+    // Without a filter these would be the logs of the whole app.
+    enabled: !!(filter.commandId || filter.eventId || filter.messageId),
+  });
+  return useResponseData(query);
 }

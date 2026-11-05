@@ -8,6 +8,7 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/diamondburned/arikawa/v3/discord"
 	"github.com/diamondburned/arikawa/v3/gateway"
 	"github.com/diamondburned/arikawa/v3/state"
 	"github.com/kitecloud/kite/kite-service/internal/model"
@@ -35,11 +36,17 @@ type Env struct {
 	PluginInstanceStore  store.PluginInstanceStore
 	PluginValueStore     store.PluginValueStore
 	PluginRegistry       *plugin.Registry
+	VariableStore        store.VariableStore
 	VariableValueStore   store.VariableValueStore
+	TableStore           store.TableStore
 	ResumePointStore     store.ResumePointStore
+	AppSecretStore       store.AppSecretStore
+	AppIntegrationStore  store.AppIntegrationStore
 	HttpClient           *http.Client
 	OpenaiClient         *openai.Client
+	OpenRouterAPIKey     string
 	TokenCrypt           *util.SymmetricCrypt
+	CooldownProvider     provider.CooldownProvider
 }
 
 type entityLinks struct {
@@ -50,10 +57,31 @@ type entityLinks struct {
 	FlowSourceID      null.String // For message templates that have multiple flows
 }
 
+func (l entityLinks) usageRecordType() model.UsageRecordType {
+	switch {
+	case l.EventListenerID.Valid:
+		return model.UsageRecordTypeEventListenerFlowExecution
+	case l.MessageID.Valid:
+		return model.UsageRecordTypeMessageFlowExecution
+	default:
+		return model.UsageRecordTypeCommandFlowExecution
+	}
+}
+
 func (s Env) flowProviders(appID string, session *state.State, links entityLinks) flow.FlowProviders {
 	var aiProvider provider.AIProvider = &provider.MockAIProvider{}
 	if s.OpenaiClient != nil {
 		aiProvider = NewAIProvider(s.OpenaiClient)
+	}
+
+	var decisionProvider provider.DecisionProvider = noDecisionProvider{}
+	if s.OpenRouterAPIKey != "" {
+		decisionProvider = NewDecisionProvider(s.HttpClient, s.OpenRouterAPIKey)
+	}
+
+	var cooldownProvider provider.CooldownProvider = &provider.MockCooldownProvider{}
+	if s.CooldownProvider != nil {
+		cooldownProvider = s.CooldownProvider
 	}
 
 	return flow.FlowProviders{
@@ -66,52 +94,72 @@ func (s Env) flowProviders(appID string, session *state.State, links entityLinks
 		),
 		HTTP:            NewHTTPProvider(s.HttpClient),
 		AI:              aiProvider,
+		Decision:        decisionProvider,
 		MessageTemplate: NewMessageTemplateProvider(appID, s.MessageStore, s.MessageInstanceStore),
-		Variable:        NewVariableProvider(appID, s.VariableValueStore),
+		Variable:        NewVariableProvider(appID, s.VariableStore, s.VariableValueStore),
+		Table:           NewTableProvider(appID, s.TableStore),
+		Cooldown:        cooldownProvider,
 		ResumePoint: NewResumePointProvider(
 			s.ResumePointStore,
 			s.TokenCrypt,
 			appID,
 			links,
 		),
+		Secret:      NewSecretProvider(appID, s.AppSecretStore, s.TokenCrypt),
+		Integration: NewIntegrationProvider(appID, s.AppSecretStore, s.AppIntegrationStore, s.TokenCrypt),
 	}
+}
+
+func flowContextData(event gateway.Event) flow.FlowContextData {
+	if e, ok := event.(*gateway.InteractionCreateEvent); ok {
+		return &InteractionData{interaction: &e.InteractionEvent}
+	}
+	return &EventData{event: event}
 }
 
 func (s Env) flowContext(
 	ctx context.Context,
 	appID string,
 	session *state.State,
-	event gateway.Event,
+	data flow.FlowContextData,
 	links entityLinks,
 	state *flow.FlowContextState,
+	node *flow.CompiledFlowNode,
 ) *flow.FlowContext {
 	providers := s.flowProviders(appID, session, links)
 
-	var data flow.FlowContextData
 	var evalCtx eval.Context
-
-	switch e := event.(type) {
-	case *gateway.InteractionCreateEvent:
-		data = &InteractionData{
-			interaction: &e.InteractionEvent,
-		}
-		evalCtx = eval.NewContextFromInteraction(&e.InteractionEvent, session)
-	default:
-		data = &EventData{
-			event: event,
-		}
-		evalCtx = eval.NewContextFromEvent(event, session)
+	if i := data.Interaction(); i != nil {
+		evalCtx = eval.NewContextFromInteraction(i, session)
+	} else {
+		evalCtx = eval.NewContextFromEvent(data.Event(), session)
 	}
 
+	var earlier []eval.Context
 	if state != nil {
-		earlier := make([]eval.Context, len(state.Triggers))
+		earlier = make([]eval.Context, len(state.Triggers))
 		for i := range state.Triggers {
 			earlier[i] = triggerEvalContext(&state.Triggers[i], session)
 		}
-		evalCtx.SetResumeContext(earlier)
 	}
 
-	return flow.NewContext(
+	// Earlier interactions and events are of the same app.
+	app, _ := evalCtx.Env["app"].(*eval.AppEnv)
+	if app != nil {
+		for _, c := range earlier {
+			c.Env["app"] = app
+		}
+	}
+	evalCtx.SetResumeContext(earlier)
+
+	// Every node of a flow has its parameters, also when it's resumed.
+	params := map[string]string{}
+	if node != nil && node.Parameters != nil {
+		params = node.Parameters
+	}
+	evalCtx.Env["params"] = params
+
+	fCtx := flow.NewContext(
 		ctx,
 		30*time.Second,
 		data,
@@ -124,6 +172,21 @@ func (s Env) flowContext(
 		evalCtx,
 		state,
 	)
+
+	// The install count is only loaded when a flow uses it, within the
+	// timeout of the flow.
+	if app != nil {
+		appStore := s.AppStore
+		app.SetUserInstallCount(func() (int, error) {
+			count, err := appStore.AppDiscordUserInstallCount(fCtx, appID)
+			if err != nil {
+				return 0, fmt.Errorf("failed to get app user install count: %w", err)
+			}
+			return int(count.Int64), nil
+		})
+	}
+
+	return fCtx
 }
 
 func triggerEvalContext(trigger *flow.FlowTrigger, session *state.State) eval.Context {
@@ -144,26 +207,23 @@ func (s Env) executeFlowEvent(
 ) {
 	defer s.recoverPanic(appID, links)
 
+	var botID discord.UserID
+	if session != nil {
+		botID = session.Ready().User.ID
+	}
+
+	// Filters only look at the event, so events they drop skip building the
+	// flow context.
+	data := flowContextData(event)
+	if !node.FilterEvent(data, botID) {
+		return
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	fCtx := s.flowContext(ctx, appID, session, event, links, state)
+	fCtx := s.flowContext(ctx, appID, session, data, links, state, node)
 	defer fCtx.Cancel()
-
-	shouldExecute, err := node.FilterEvent(fCtx)
-	if err != nil {
-		s.createLogEntry(
-			appID,
-			model.LogLevelError,
-			fmt.Sprintf("Failed to filter events: %v", err),
-			links,
-		)
-		return
-	}
-
-	if !shouldExecute {
-		return
-	}
 
 	s.finishFlowRun(appID, links, fCtx, node.Execute(fCtx), "Failed to execute flow event")
 }
@@ -184,7 +244,7 @@ func (s Env) executeFlowAfterSleep(
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	fCtx := s.flowContext(ctx, appID, session, event, links, state)
+	fCtx := s.flowContext(ctx, appID, session, flowContextData(event), links, state, node)
 	defer fCtx.Cancel()
 
 	// The sleep acknowledged the interaction before suspending, so responses
@@ -199,12 +259,15 @@ func (s Env) executeFlowAfterSleep(
 // finishFlowRun records the error and usage of a flow execution.
 func (s Env) finishFlowRun(appID string, links entityLinks, fCtx *flow.FlowContext, err error, errMessage string) {
 	if err != nil {
-		s.createLogEntry(
-			appID,
-			model.LogLevelError,
-			fmt.Sprintf("%s: %v", errMessage, err),
-			links,
-		)
+		entry := newLogEntry(appID, model.LogLevelError, fmt.Sprintf("%s: %v", errMessage, err), links)
+
+		info := flow.DescribeError(err)
+		entry.NodeID = null.NewString(info.NodeID, info.NodeID != "")
+		entry.NodeType = null.NewString(string(info.NodeType), info.NodeType != "")
+		entry.ErrorCode = null.StringFrom(string(info.Code))
+		entry.Details = info.Details
+
+		s.storeLogEntry(entry)
 	}
 
 	s.createUsageRecord(
@@ -215,11 +278,11 @@ func (s Env) finishFlowRun(appID string, links entityLinks, fCtx *flow.FlowConte
 }
 
 func (s Env) createLogEntry(appID string, level model.LogLevel, message string, links entityLinks) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-	defer cancel()
+	s.storeLogEntry(newLogEntry(appID, level, message, links))
+}
 
-	// Create log entry which will be displayed in the dashboard
-	err := s.LogStore.CreateLogEntry(ctx, model.LogEntry{
+func newLogEntry(appID string, level model.LogLevel, message string, links entityLinks) model.LogEntry {
+	return model.LogEntry{
 		AppID:           appID,
 		Level:           level,
 		Message:         message,
@@ -227,9 +290,17 @@ func (s Env) createLogEntry(appID string, level model.LogLevel, message string, 
 		EventListenerID: links.EventListenerID,
 		MessageID:       links.MessageID,
 		CreatedAt:       time.Now().UTC(),
-	})
+	}
+}
+
+func (s Env) storeLogEntry(entry model.LogEntry) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+
+	// Create log entry which will be displayed in the dashboard
+	err := s.LogStore.CreateLogEntry(ctx, entry)
 	if err != nil {
-		slog.With("error", err).With("app_id", appID).Error("Failed to create log entry from engine")
+		slog.With("error", err).With("app_id", entry.AppID).Error("Failed to create log entry from engine")
 	}
 }
 
@@ -240,7 +311,7 @@ func (s Env) createUsageRecord(appID string, creditsUsed int, links entityLinks)
 	start := time.Now()
 	err := s.UsageStore.CreateUsageRecord(ctx, model.UsageRecord{
 		AppID:           appID,
-		Type:            model.UsageRecordTypeCommandFlowExecution,
+		Type:            links.usageRecordType(),
 		CommandID:       links.CommandID,
 		EventListenerID: links.EventListenerID,
 		MessageID:       links.MessageID,

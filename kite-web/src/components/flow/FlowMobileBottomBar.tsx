@@ -1,0 +1,222 @@
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { getNodeValues } from "@/lib/flow/nodes";
+import { useReactFlow } from "@xyflow/react";
+import { cn } from "@/lib/utils";
+import { useMissingParameterCount } from "@/lib/flow/parametersStore";
+import {
+  ListTreeIcon,
+  Maximize2Icon,
+  MessageSquareWarningIcon,
+  MoreHorizontalIcon,
+  PencilIcon,
+  PlusIcon,
+  Redo2Icon,
+  SlidersHorizontalIcon,
+  StickyNoteIcon,
+  Undo2Icon,
+  XIcon,
+} from "lucide-react";
+
+interface Props {
+  selectedNodeId: string | null;
+  hidden?: boolean;
+  onAddBlock: () => void;
+  onEditNode: () => void;
+  onDeselectNode: () => void;
+  onOpenLogs: () => void;
+  onOpenParameters: () => void;
+  onFitView: () => void;
+  onUndo?: () => void;
+  onRedo?: () => void;
+  onFormat?: () => void;
+  onAddNote?: () => void;
+  canUndo?: boolean;
+  canRedo?: boolean;
+  logCount?: number;
+}
+
+export default function FlowMobileBottomBar({
+  selectedNodeId,
+  hidden,
+  onAddBlock,
+  onEditNode,
+  onDeselectNode,
+  onOpenLogs,
+  onOpenParameters,
+  onFitView,
+  onUndo,
+  onRedo,
+  onFormat,
+  onAddNote,
+  canUndo = false,
+  canRedo = false,
+  logCount = 0,
+}: Props) {
+  const { getNode } = useReactFlow();
+  const selectedNode = selectedNodeId ? getNode(selectedNodeId) : null;
+  const nodeValues = selectedNode?.type
+    ? getNodeValues(selectedNode.type)
+    : null;
+  const nodeTitle = nodeValues?.defaultTitle ?? "Block";
+  const missingParameters = useMissingParameterCount();
+
+  return (
+    <div
+      className={cn(
+        "fixed bottom-0 inset-x-0 z-30 md:hidden bg-background/95 backdrop-blur-md border-t border-border px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] flex items-center justify-between gap-2 shadow-lg select-none",
+        hidden && "hidden"
+      )}
+    >
+      <div className="flex items-center gap-1.5 min-w-0">
+        <Button
+          size="sm"
+          className="gap-1.5 h-9 rounded-full px-3 flex-none font-medium shadow-sm"
+          onClick={onAddBlock}
+        >
+          <PlusIcon className="size-4" />
+          <span className={selectedNodeId ? "hidden sm:inline" : ""}>
+            Add Block
+          </span>
+        </Button>
+
+        {selectedNodeId && (
+          <div className="flex items-center gap-1 bg-muted/80 rounded-full pl-2.5 pr-1 h-9 border border-primary/40 min-w-0 max-w-[140px] sm:max-w-[190px]">
+            <button
+              type="button"
+              className="flex items-center gap-1.5 text-xs font-medium text-foreground truncate"
+              onClick={onEditNode}
+              title={`Edit ${nodeTitle}`}
+            >
+              <PencilIcon className="size-3 text-primary flex-none" />
+              <span className="truncate">{nodeTitle}</span>
+            </button>
+            <button
+              type="button"
+              className="p-1 text-muted-foreground hover:text-foreground rounded-full flex-none"
+              onClick={onDeselectNode}
+              title="Deselect block"
+            >
+              <XIcon className="size-3.5" />
+            </button>
+          </div>
+        )}
+      </div>
+
+      <div className="flex items-center gap-0.5 bg-muted/60 p-0.5 rounded-full border border-border/50 flex-none">
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-8 rounded-full disabled:opacity-30"
+          onClick={onUndo}
+          disabled={!canUndo}
+          title="Undo"
+        >
+          <Undo2Icon className="size-4" />
+        </Button>
+
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-8 rounded-full disabled:opacity-30"
+          onClick={onRedo}
+          disabled={!canRedo}
+          title="Redo"
+        >
+          <Redo2Icon className="size-4" />
+        </Button>
+
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-8 rounded-full"
+          onClick={onFitView}
+          title="Fit to view"
+        >
+          <Maximize2Icon className="size-4" />
+        </Button>
+
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-8 rounded-full relative"
+          onClick={onOpenParameters}
+          title={
+            missingParameters
+              ? `Parameters (${missingParameters} without a value)`
+              : "Parameters"
+          }
+        >
+          <SlidersHorizontalIcon className="size-4" />
+          <CountBadge
+            count={missingParameters}
+            className="bg-amber-500 text-white"
+          />
+        </Button>
+
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-8 rounded-full relative"
+          onClick={onOpenLogs}
+          title="Logs"
+        >
+          <MessageSquareWarningIcon className="size-4" />
+          <CountBadge
+            count={logCount}
+            className="bg-primary text-primary-foreground"
+          />
+        </Button>
+
+        {/* In a menu so the bar fits on 375px wide phones. */}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-8 rounded-full"
+              title="More"
+            >
+              <MoreHorizontalIcon className="size-4" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent side="top" align="end">
+            <DropdownMenuItem onClick={onFormat}>
+              <ListTreeIcon className="h-4 w-4 mr-2 text-muted-foreground" />
+              Auto arrange layout
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={onAddNote}>
+              <StickyNoteIcon className="h-4 w-4 mr-2 text-muted-foreground" />
+              Add note
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+    </div>
+  );
+}
+
+function CountBadge({
+  count,
+  className,
+}: {
+  count: number;
+  className: string;
+}) {
+  if (count <= 0) return null;
+  return (
+    <span
+      className={cn(
+        "absolute -top-1 -right-1 size-3.5 text-[9px] font-bold rounded-full flex items-center justify-center",
+        className
+      )}
+    >
+      {count > 9 ? "9+" : count}
+    </span>
+  );
+}

@@ -2,6 +2,7 @@ import { Edge, Node } from "@xyflow/react";
 import { describe, expect, it } from "vitest";
 import { NodeData } from "./dataSchema";
 import { applyFlowEdits, FlowEdit } from "./edits";
+import { getFlowLayout, isFlowLaidOut, nodeSize, rowGap } from "./layout";
 import { serializeFlow } from "./serialize";
 import { testEdge as edge, testNode } from "./testUtils";
 
@@ -56,6 +57,14 @@ describe("applyFlowEdits", () => {
     expect(res.edges[1].type).toBe("delete_button");
   });
 
+  it("refers to the entry block as $entry", () => {
+    const res = apply([entry], [], [addLog("$a", "$entry")]);
+
+    expect(res.issues).toEqual([]);
+    expect(res.connections).toEqual([`entry->${res.refs.$a}`]);
+    expect(res.refs).not.toHaveProperty("$entry");
+  });
+
   it("puts blocks into existing connections and moves the rest down", () => {
     const res = apply(
       [entry, log("a", "hi", 250), log("b", "hi", 500)],
@@ -103,6 +112,50 @@ describe("applyFlowEdits", () => {
     ).toEqual(["fixed", "fixed", "fixed"]);
   });
 
+  it("uses the else branch for empty items", () => {
+    const res = apply(
+      [entry],
+      [],
+      [
+        {
+          op: "add_node",
+          ref: "$check",
+          type: "control_condition_compare",
+          data: { condition_base_value: "{{user.id}}" },
+          items: [
+            { condition_item_mode: "equal", condition_item_value: "1" },
+            { else: true },
+          ],
+          after: "entry",
+        },
+        addLog("$one", "$check.item0"),
+        addLog("$other", "$check.item1"),
+      ]
+    );
+
+    expect(res.issues).toEqual([]);
+    expect(res.refs["$check.item1"]).toBe(res.refs["$check.else"]);
+    expect(
+      res.nodes.filter((n) => n.type === "control_condition_item_compare")
+    ).toHaveLength(1);
+
+    const empty = apply(
+      [entry],
+      [],
+      [
+        {
+          op: "add_node",
+          ref: "$check",
+          type: "control_condition_compare",
+          items: [{}, {}],
+          after: "entry",
+        },
+      ]
+    );
+    expect(empty.refs["$check.item0"]).not.toBe(empty.refs["$check.else"]);
+    expect(empty.refs["$check.item1"]).toBe(empty.refs["$check.else"]);
+  });
+
   it("creates loops with their each and end blocks", () => {
     const res = apply(
       [entry],
@@ -127,7 +180,7 @@ describe("applyFlowEdits", () => {
     expect(res.issues).toEqual([]);
   });
 
-  it("connects options into the entry and places them above it", () => {
+  it("connects options into the entry wherever they're put and places them above it", () => {
     const res = apply(
       [node("entry", "entry_command", entry.data, { x: 0, y: 500 })],
       [],
@@ -141,6 +194,8 @@ describe("applyFlowEdits", () => {
             description: "User",
             command_argument_type: "user",
           },
+          after: "entry",
+          handle: "default",
         },
       ]
     );
@@ -221,6 +276,11 @@ describe("applyFlowEdits", () => {
         { op: "update_node", id: "$missing", data: {} },
         addLog("$b", "a", "entry"),
         { op: "disconnect", source: "a", target: "entry" },
+        // Like an edit the service couldn't read.
+        {
+          op: "update_node",
+          error: "data_json isn't a JSON object",
+        } as FlowEdit,
         addLog("$c", "a"),
       ]
     );
@@ -230,6 +290,7 @@ describe("applyFlowEdits", () => {
       "Edit 2 (update_node): There is no block '$missing'.",
       "Edit 3 (add_node): 'a' isn't connected to 'entry'.",
       "Edit 4 (disconnect): 'a' isn't connected to 'entry'.",
+      "Edit 5 (update_node): data_json isn't a JSON object",
     ]);
     expect(res.nodes).toHaveLength(3);
     expect(res.connections).toEqual(["entry->a", `a->${res.refs.$c}`]);
@@ -299,6 +360,45 @@ describe("applyFlowEdits edge cases", () => {
     expect(res.connections).toEqual(["entry->next"]);
   });
 
+  it("adds blocks after the buttons of a message added in the same reply", () => {
+    const res = apply(
+      [entry],
+      [],
+      [
+        {
+          op: "add_node",
+          ref: "$msg",
+          type: "action_response_create",
+          after: "entry",
+          data: {
+            message_data: {
+              content: "Sure?",
+              components: [
+                {
+                  type: 1,
+                  components: [{ type: 2, id: 1, style: 3, label: "Yes" }],
+                },
+              ],
+            },
+          },
+        },
+        {
+          op: "add_node",
+          ref: "$yes",
+          type: "action_log",
+          data: logData,
+          after: "$msg",
+          handle: "component_1",
+        },
+      ]
+    );
+    expect(res.issues).toEqual([]);
+    expect(res.connections).toEqual([
+      `entry->${res.refs.$msg}`,
+      `${res.refs.$msg}[component_1]->${res.refs.$yes}`,
+    ]);
+  });
+
   it("removes blocks with connections to missing blocks", () => {
     const res = apply(
       [entry, log("a")],
@@ -307,6 +407,112 @@ describe("applyFlowEdits edge cases", () => {
     );
     expect(res.issues.filter((i) => i.message.startsWith("Edit"))).toEqual([]);
     expect(res.nodes.map((n) => n.id)).toEqual(["entry"]);
+  });
+
+  it("keeps options out of the chain of blocks", () => {
+    const res = apply(
+      [entry],
+      [],
+      [
+        {
+          op: "add_node",
+          ref: "$arg",
+          type: "option_command_argument",
+          data: {
+            name: "user",
+            description: "User",
+            command_argument_type: "user",
+          },
+        },
+        { ...addLog("$log", "$arg") },
+        { op: "connect", source: "entry", target: "$arg" },
+        { op: "disconnect", source: "$arg", target: "entry" },
+      ]
+    );
+    const arg = res.refs.$arg;
+    expect(res.connections).toEqual([
+      `${arg}->entry`,
+      `entry->${res.refs.$log}`,
+    ]);
+    expect(res.issues.map((i) => i.message)).toEqual([
+      "Edit 3 (connect): Nothing can be connected into 'Command Argument'. Options are connected to the entry block automatically.",
+      "Edit 4 (disconnect): Options are always connected to the entry block. Remove the option instead.",
+    ]);
+  });
+
+  it("accepts refs without their $", () => {
+    const res = apply(
+      [entry],
+      [],
+      [{ ...addLog("log", "entry") }, { ...addLog("$other", "log") }]
+    );
+    expect(res.issues).toEqual([]);
+    expect(res.connections).toEqual([
+      `entry->${res.refs.$log}`,
+      `${res.refs.$log}->${res.refs.$other}`,
+    ]);
+  });
+
+  it("treats null settings of new blocks as left out", () => {
+    const res = apply(
+      [entry],
+      [],
+      [
+        {
+          op: "add_node",
+          ref: "$log",
+          type: "action_log",
+          after: "entry",
+          data: { ...logData, custom_label: null } as unknown as NodeData,
+        },
+      ]
+    );
+    expect(res.byId(res.refs.$log)?.data).toEqual(logData);
+    expect(res.issues).toEqual([]);
+  });
+
+  it("explains how to handle clicks and conditions", () => {
+    const res = apply(
+      [entry],
+      [],
+      [
+        { op: "add_node", ref: "$button", type: "entry_component_button" },
+        {
+          op: "add_node",
+          ref: "$check",
+          type: "control_condition_compare",
+          after: "entry",
+          data: { condition_base_value: "a" },
+          items: [{ condition_item_mode: "equal", condition_item_value: "a" }],
+        },
+        addLog("$log", "$check"),
+        { op: "connect", source: "$check", target: "entry" },
+      ]
+    );
+    const messages = res.issues.map((i) => i.message);
+    expect(messages[0]).toContain("A flow has one entry block");
+    expect(messages[1]).toMatch(
+      /^Edit 3 \(add_node\): 'Comparison Condition' has no outputs of its own\. Connect blocks to its branches instead: \S+ \(Else\), \S+ \(Match Condition\)\.$/
+    );
+  });
+
+  it("reports fields generated edits left out", () => {
+    const res = apply(
+      [entry, log("a")],
+      [],
+      [{ op: "connect", target: "a" } as unknown as FlowEdit]
+    );
+    expect(res.issues[0].message).toBe("Edit 1 (connect): source is missing.");
+  });
+
+  it("ignores updates without settings", () => {
+    const res = apply(
+      [entry, log("a")],
+      [edge("entry", "a")],
+      [{ op: "update_node", id: "a" } as unknown as FlowEdit]
+    );
+    expect(res.issues).toEqual([]);
+    expect(res.byId("a")?.data).toEqual(logData);
   });
 
   it("rejects edits the editor doesn't allow", () => {
@@ -388,6 +594,59 @@ describe("applyFlowEdits edge cases", () => {
   });
 });
 
+describe("applyFlowEdits layout", () => {
+  const reply = (after: string): FlowEdit => ({
+    op: "add_node",
+    ref: "$reply",
+    type: "action_response_create",
+    data: {
+      message_data: {
+        content: "hi",
+        components: [1, 2, 3, 4].map((id) => ({
+          type: 1,
+          components: [{ type: 2, id, label: "Hi", style: 1 }],
+        })),
+      },
+    },
+    after,
+  });
+
+  it("lays out new and formatted flows like the format button", () => {
+    const created = apply(
+      [entry],
+      [],
+      [reply("$entry"), addLog("$log", "$reply")]
+    );
+    expect(created.issues).toEqual([]);
+    expect(isFlowLaidOut(created.nodes, created.edges)).toBe(true);
+
+    const edges = [edge("entry", "a"), edge("a", "b")];
+    const formatted = getFlowLayout([entry, log("a"), log("b")], edges);
+    const res = apply(formatted, edges, [addLog("$new", "entry", "a")]);
+    expect(isFlowLaidOut(res.nodes, res.edges)).toBe(true);
+  });
+
+  it("keeps blocks of rearranged flows where they are", () => {
+    const res = apply(
+      [
+        entry,
+        log("a", "hi", 300),
+        { ...log("b", "hi", 600), position: { x: 900, y: 600 } },
+      ],
+      [edge("entry", "a"), edge("a", "b")],
+      [reply("a"), addLog("$log", "$reply")]
+    );
+    expect(res.byId("a")?.position).toEqual({ x: 0, y: 300 });
+    expect(res.byId("b")?.position).toEqual({ x: 900, y: 600 });
+
+    // Below the message with its rows of buttons, not on top of them.
+    const message = res.byId(res.refs.$reply)!;
+    expect(res.byId(res.refs.$log)!.position.y).toBe(
+      message.position.y + nodeSize(message).height + rowGap
+    );
+  });
+});
+
 describe("applyFlowEdits checks", () => {
   const condition = (): FlowEdit => ({
     op: "add_node",
@@ -412,12 +671,6 @@ describe("applyFlowEdits checks", () => {
           after: added.refs.$check,
           before: added.refs["$check.else"],
         },
-        {
-          op: "add_node",
-          ref: "$arg",
-          type: "option_command_argument",
-          after: "entry",
-        },
       ],
       "command"
     );
@@ -425,7 +678,6 @@ describe("applyFlowEdits checks", () => {
       "Edit 1 (add_node): The ref '$a.else' must be unique and look like '$name', with only letters, numbers and underscores.",
       "Edit 2 (add_node): items must be a list of branch settings, and only conditions have branches.",
       `Edit 3 (add_node): '${added.refs["$check.else"]}' belongs to another block, so nothing can be put in front of it. Add the block after it instead.`,
-      "Edit 4 (add_node): Options are always connected to the entry block, so leave out after, before and handle.",
     ]);
     expect(res.nodes).toHaveLength(added.nodes.length);
     expect(res.edges).toHaveLength(added.edges.length);
@@ -494,10 +746,10 @@ describe("serializeFlow", () => {
         "Flow type: command",
         "",
         "Blocks:",
-        '- entry entry_command {"name":"test","description":"Test"}',
-        '- arg option_command_argument {"name":"user","description":"User","command_argument_type":"user"}',
-        "- handler control_error_handler",
-        '- b action_log (selected) {"log_level":"info","log_message":"bye"}',
+        '- entry: entry_command "Command" {"name":"test","description":"Test"}',
+        '- arg: option_command_argument "Command Argument" {"name":"user","description":"User","command_argument_type":"user"}',
+        '- handler: control_error_handler "Handle Errors"',
+        '- b: action_log "Log Message" (selected) {"log_level":"info","log_message":"bye"}',
         "",
         "Connections:",
         "- entry -> handler",

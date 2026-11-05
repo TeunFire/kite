@@ -73,6 +73,7 @@ export default function MessageAttachmentSection() {
     <CollapsibleSection
       title="Attachments"
       validation={nodeScope<MessageNode>(rootId, ["attachments"])}
+      count={`${attachments.length} / 10`}
       className="space-y-4"
     >
       <div className="flex flex-wrap gap-4">
@@ -83,7 +84,7 @@ export default function MessageAttachmentSection() {
       <div className="space-x-3">
         <Button
           onClick={() => inputRef.current?.click()}
-          disabled={!!inputRef.current?.value || attachments.length >= 10}
+          disabled={createMutation.isPending || attachments.length >= 10}
         >
           Add Attachment
         </Button>

@@ -1,19 +1,9 @@
-import { getNodeCreditsCost, getNodeValues } from "@/lib/flow/nodes";
 import type { NextApiRequest, NextApiResponse } from "next";
-import { toJsonSchema } from "@/lib/flow/catalog";
-import { JsonSchema7Type } from "zod-to-json-schema";
+import { getNodeInfo, NodeInfo } from "@/lib/flow/nodeInfo";
+import { isKnownNodeType } from "@/lib/flow/nodes";
 import env from "@/lib/env/server";
 
-type ResponseData = {
-  title: string;
-  description: string;
-  color: string;
-  icon: string;
-  dataSchema: JsonSchema7Type | null;
-  resultSchema: JsonSchema7Type | null;
-  dataFields: string[];
-  creditsCost: number | null;
-};
+// Fetched by the block pages of the docs.
 
 // CORS middleware function
 function corsMiddleware(req: NextApiRequest, res: NextApiResponse) {
@@ -21,6 +11,9 @@ function corsMiddleware(req: NextApiRequest, res: NextApiResponse) {
   const allowedOrigins = [env.NEXT_PUBLIC_DOCS_LINK];
 
   const origin = req.headers.origin;
+
+  // The response depends on the origin, so caches must not share it.
+  res.setHeader("Vary", "Origin");
 
   if (origin && allowedOrigins.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
@@ -44,30 +37,18 @@ function corsMiddleware(req: NextApiRequest, res: NextApiResponse) {
 
 export default function handler(
   req: NextApiRequest,
-  res: NextApiResponse<ResponseData>
+  res: NextApiResponse<NodeInfo | null>
 ) {
   // Handle CORS
   if (corsMiddleware(req, res)) {
     return;
   }
 
-  const { nodeType } = req.query;
+  const nodeType = String(req.query.nodeType);
+  if (!isKnownNodeType(nodeType)) {
+    res.status(404).json(null);
+    return;
+  }
 
-  const values = getNodeValues(nodeType as string);
-
-  const dataSchema = values.dataSchema ? toJsonSchema(values.dataSchema) : null;
-  const resultSchema = values.resultSchema
-    ? toJsonSchema(values.resultSchema)
-    : null;
-
-  res.status(200).json({
-    title: values.defaultTitle,
-    description: values.defaultDescription,
-    color: values.color,
-    icon: values.icon,
-    dataSchema,
-    resultSchema,
-    dataFields: values.dataFields,
-    creditsCost: getNodeCreditsCost(values, {}) ?? null,
-  });
+  res.status(200).json(getNodeInfo(nodeType));
 }

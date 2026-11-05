@@ -1,3 +1,4 @@
+import { withoutParameterValues } from "@/lib/flow/parameters";
 import {
   useEventListenerDeleteMutation,
   useEventListenerUpdateEnabledMutation,
@@ -5,6 +6,7 @@ import {
 import { useAppId } from "@/lib/hooks/params";
 import { EventListener } from "@/lib/types/wire.gen";
 import { formatDateTime } from "@/lib/utils";
+import { getWebhookUrl } from "@/lib/flow/webhook";
 import {
   CheckIcon,
   ClockIcon,
@@ -13,12 +15,15 @@ import {
   SatelliteDishIcon,
   Trash2Icon,
   Share2Icon,
+  LinkIcon,
+  WebhookIcon,
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/router";
 import { useCallback } from "react";
 import { toast } from "sonner";
 import ConfirmDialog from "../common/ConfirmDialog";
+import BundleInstallBadge from "./BundleInstallBadge";
 import { Button } from "../ui/button";
 import {
   Card,
@@ -38,6 +43,13 @@ import { Switch } from "../ui/switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
 import EventListenerDuplicateDialog from "./EventListenerDuplicateDialog";
 import FlowExportDialog from "./FlowExportDialog";
+import {
+  capitalize,
+  discordEventType,
+  eventSourceName,
+  schedulePresets,
+} from "@/lib/flow/eventTypes";
+import { describeSchedule } from "@/lib/flow/schedule";
 
 export default function EventListenerListEntry({
   listener,
@@ -48,10 +60,42 @@ export default function EventListenerListEntry({
 
   const appId = useAppId();
 
+  const name = eventSourceName(listener.source);
+
   const isSchedule = listener.source === "schedule";
   const scheduleCron = listener.flow_source.nodes.find(
     (n) => n.type === "entry_event"
   )?.data.event_schedule_cron;
+
+  const isWebhook = listener.source === "webhook";
+  const webhookUrl = getWebhookUrl(listener);
+
+  // Webhooks have nothing to tell them apart but their description, so it's
+  // their title.
+  const eventType = discordEventType(listener.type);
+  const Icon = isSchedule
+    ? ClockIcon
+    : isWebhook
+    ? WebhookIcon
+    : eventType?.icon ?? SatelliteDishIcon;
+  const title = isSchedule
+    ? schedulePresets.find((p) => p.cron === scheduleCron)?.label ??
+      (scheduleCron && describeSchedule(scheduleCron)
+        ? `${describeSchedule(scheduleCron)} (UTC)`
+        : undefined) ??
+      "Custom schedule"
+    : isWebhook
+    ? listener.description || name.title
+    : eventType?.label ?? listener.type;
+
+  const copyWebhookUrl = useCallback(() => {
+    if (!webhookUrl) return;
+
+    navigator.clipboard
+      .writeText(webhookUrl)
+      .then(() => toast.success("Copied to clipboard!"))
+      .catch(() => toast.error("Failed to copy to clipboard"));
+  }, [webhookUrl]);
 
   const deleteMutation = useEventListenerDeleteMutation(appId, listener.id);
 
@@ -64,15 +108,15 @@ export default function EventListenerListEntry({
     deleteMutation.mutate(undefined, {
       onSuccess(res) {
         if (res.success) {
-          toast.success("Event listener deleted!");
+          toast.success(`${capitalize(name.singular)} deleted!`);
         } else {
           toast.error(
-            `Failed to delete event listener: ${res.error.message} (${res.error.code})`
+            `Failed to delete ${name.singular}: ${res.error.message} (${res.error.code})`
           );
         }
       },
     });
-  }, [deleteMutation]);
+  }, [deleteMutation, name]);
 
   const toggleEnabled = useCallback(() => {
     updateEnabledMutation.mutate({ enabled: !listener.enabled });
@@ -80,7 +124,7 @@ export default function EventListenerListEntry({
 
   return (
     <Card className="relative">
-      <div className="absolute top-0 right-0 py-3 pr-3 h-full flex flex-col justify-between">
+      <div className="flex items-center justify-between px-6 pt-4 sm:absolute sm:top-0 sm:right-0 sm:h-full sm:flex-col sm:items-end sm:p-3">
         <div className="flex items-center space-x-2">
           <Tooltip>
             <TooltipTrigger>
@@ -100,19 +144,19 @@ export default function EventListenerListEntry({
           <Switch checked={listener.enabled} onCheckedChange={toggleEnabled} />
         </div>
       </div>
-      <CardHeader>
-        <CardTitle className="text-base flex items-center space-x-2">
-          {isSchedule ? (
-            <ClockIcon className="h-5 w-5 text-muted-foreground" />
-          ) : (
-            <SatelliteDishIcon className="h-5 w-5 text-muted-foreground" />
+      <CardHeader className="pt-3 sm:pt-6 sm:pr-56">
+        <CardTitle className="text-base flex flex-wrap items-center gap-x-2 gap-y-1">
+          <Icon className="h-5 w-5 text-muted-foreground" />
+          <div>{title}</div>
+          {isSchedule && scheduleCron && (
+            <code className="text-xs font-normal text-muted-foreground">
+              {scheduleCron}
+            </code>
           )}
-          <div>
-            {isSchedule ? `schedule ${scheduleCron ?? ""}` : listener.type}
-          </div>
+          <BundleInstallBadge bundleInstallId={listener.bundle_install_id} />
         </CardTitle>
         <CardDescription className="text-sm">
-          {listener.description}
+          {!isWebhook && listener.description}
           {isSchedule && listener.last_run_at && (
             <span className="block">
               Last run {formatDateTime(new Date(listener.last_run_at))}
@@ -143,32 +187,39 @@ export default function EventListenerListEntry({
           <DropdownMenuContent>
             <DropdownMenuGroup>
               <ConfirmDialog
-                title="Are you sure that you want to delete this event listener?"
-                description="This will remove the event listener from your app and cannot be undone."
+                title={`Are you sure that you want to delete this ${name.singular}?`}
+                description={`This will remove the ${name.singular} from your app and cannot be undone.`}
                 onConfirm={remove}
               >
                 <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
                   <Trash2Icon className="h-4 w-4 mr-2 text-muted-foreground" />
-                  Delete Event Listener
+                  Delete {name.title}
                 </DropdownMenuItem>
               </ConfirmDialog>
               <EventListenerDuplicateDialog listener={listener}>
                 <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
                   <CopyPlusIcon className="h-4 w-4 mr-2 text-muted-foreground" />
-                  Duplicate Event Listener
+                  Duplicate {name.title}
                 </DropdownMenuItem>
               </EventListenerDuplicateDialog>
+              {webhookUrl && (
+                <DropdownMenuItem onSelect={copyWebhookUrl}>
+                  <LinkIcon className="h-4 w-4 mr-2 text-muted-foreground" />
+                  Copy Webhook URL
+                </DropdownMenuItem>
+              )}
               <FlowExportDialog
-                title="Export Event Listener"
+                title={`Export ${name.title}`}
                 type="event_listener"
                 shareData={{
                   source: listener.source,
-                  flow_source: listener.flow_source,
+                  flow_source: withoutParameterValues(listener.flow_source),
                 }}
+                flows={[listener.flow_source]}
               >
                 <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
                   <Share2Icon className="h-4 w-4 mr-2 text-muted-foreground" />
-                  Export Event Listener
+                  Export {name.title}
                 </DropdownMenuItem>
               </FlowExportDialog>
             </DropdownMenuGroup>

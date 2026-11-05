@@ -15,6 +15,11 @@ export function useVariableId() {
   return router.query.variableId as string;
 }
 
+export function useTableId() {
+  const router = useRouter();
+  return router.query.tableId as string;
+}
+
 export function useMessageId() {
   const router = useRouter();
   return router.query.messageId as string;
@@ -28,4 +33,14 @@ export function useEventId() {
 export function usePluginId() {
   const router = useRouter();
   return router.query.pluginId as string;
+}
+
+export function useTemplateId() {
+  const router = useRouter();
+  return router.query.templateId as string;
+}
+
+export function useBundleId() {
+  const router = useRouter();
+  return router.query.bundleId as string;
 }
