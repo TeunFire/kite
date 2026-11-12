@@ -7,6 +7,7 @@ import { FlowContextType } from "@/lib/flow/context";
 import { Command, LogEntry } from "@/lib/types/wire.gen";
 import { FlowEditorApi } from "./FlowEditor";
 import { ItemVersionTarget } from "@/lib/api/queries";
+import { useEditorUsage } from "@/lib/hooks/editorUsage";
 import {
   useEditorSession,
   useVersionHistory,
@@ -57,6 +58,7 @@ function InnerFlowPage({
   const [saveCount, setSaveCount] = useState(0);
 
   const editorSession = useEditorSession();
+  useEditorUsage(versionTarget, editorSession, saveCount);
   // Set by a restore until it's saved, so it's saved without the session even
   // if the first try fails.
   const restorePending = useRef(false);

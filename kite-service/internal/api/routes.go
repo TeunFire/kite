@@ -83,6 +83,7 @@ func (s *APIServer) RegisterRoutes(
 	apiTokenStore store.APITokenStore,
 	oauthCodeStore store.OAuthCodeStore,
 	notifier *notify.Notifier,
+	editorSessionStore store.EditorSessionStore,
 ) {
 	sessionManager := session.NewSessionManager(session.SessionManagerConfig{
 		StrictCookies: s.config.StrictCookies,
@@ -259,7 +260,17 @@ func (s *APIServer) RegisterRoutes(
 
 	// Support staff routes are separately allowlisted and only expose read-only
 	// app inspection. The path's appID is always the Kite app ID.
-	supportHandler := supporthandler.NewSupportHandler(appStore, logStore, commandStore, eventListenerStore)
+	supportHandler := supporthandler.NewSupportHandler(
+		appStore,
+		logStore,
+		commandStore,
+		eventListenerStore,
+		editorSessionStore,
+	)
+	appGroup.Put(
+		"/editor-sessions/{sessionID}",
+		handler.TypedWithBody(supportHandler.HandleEditorSessionUpsert),
+	)
 	supportGroup := v1Group.Group(
 		"/support",
 		sessionManager.RequireSession,
@@ -271,6 +282,7 @@ func (s *APIServer) RegisterRoutes(
 	supportAppGroup.Get("/logs", handler.Typed(supportHandler.HandleLogEntryList))
 	supportAppGroup.Get("/commands", handler.Typed(supportHandler.HandleCommandList))
 	supportAppGroup.Get("/event-listeners", handler.Typed(supportHandler.HandleEventListenerList))
+	supportAppGroup.Get("/editor-usage", handler.Typed(supportHandler.HandleEditorUsageGet))
 
 	// Billing routes
 	lemonSqueezyClient := corebilling.NewLemonSqueezyClient(

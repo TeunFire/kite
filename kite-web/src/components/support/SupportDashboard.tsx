@@ -28,7 +28,7 @@ type EventListener = {
   description: string;
   enabled: boolean;
   app_id: string;
-  module_id: string | null;
+  bundle_install_id: string | null;
   creator_user_id: string;
   flow_source: FlowData;
   created_at: string;
@@ -39,6 +39,20 @@ type EventListener = {
 type SupportLogPage = {
   entries: LogEntry[];
   next_before: number;
+};
+
+type EditorUsageItem = {
+  target_type: "command" | "event_listener";
+  target_id: string;
+  active_seconds: number;
+  save_count: number;
+  session_count: number;
+  last_edited_at: string | null;
+};
+
+type EditorUsage = {
+  total: Omit<EditorUsageItem, "target_type" | "target_id">;
+  items: EditorUsageItem[];
 };
 
 class SupportApiError extends Error {
@@ -70,6 +84,14 @@ function dateLabel(value: string | null | undefined) {
   if (!value) return "—";
   const date = new Date(value);
   return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
+}
+
+function durationLabel(seconds: number) {
+  const totalMinutes = Math.floor(seconds / 60);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours === 0) return `${minutes}m`;
+  return minutes === 0 ? `${hours}h` : `${hours}h ${minutes}m`;
 }
 
 function errorMessage(error: unknown) {
@@ -132,6 +154,14 @@ export default function SupportDashboard({ appId }: { appId: string }) {
     queryKey: ["support", "apps", appId],
     queryFn: () =>
       supportRequest<App>(`/v1/support/apps/${encodeURIComponent(appId)}`),
+    enabled: authorized && !!appId,
+  });
+  const editorUsage = useQuery({
+    queryKey: ["support", "apps", appId, "editor-usage"],
+    queryFn: () =>
+      supportRequest<EditorUsage>(
+        `/v1/support/apps/${encodeURIComponent(appId)}/editor-usage`
+      ),
     enabled: authorized && !!appId,
   });
   const commands = useQuery({
@@ -267,33 +297,62 @@ export default function SupportDashboard({ appId }: { appId: string }) {
             )}
 
             {app.data && section === "overview" && (
-              <section className="rounded-xl border bg-background p-5 shadow-sm">
-                <div className="flex flex-wrap items-start justify-between gap-4 border-b pb-4">
-                  <div>
-                    <h2 className="text-lg font-semibold">{app.data.name}</h2>
-                    <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
-                      Kite App ID: {app.data.id}
-                    </p>
+              <>
+                <section className="rounded-xl border bg-background p-5 shadow-sm">
+                  <div className="flex flex-wrap items-start justify-between gap-4 border-b pb-4">
+                    <div>
+                      <h2 className="text-lg font-semibold">{app.data.name}</h2>
+                      <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
+                        Kite App ID: {app.data.id}
+                      </p>
+                    </div>
                   </div>
-                </div>
-                <dl className="grid gap-x-8 gap-y-5 pt-5 sm:grid-cols-2 lg:grid-cols-3">
-                  <Info label="Description">{app.data.description}</Info>
-                  <Info label="Discord Bot ID">{app.data.discord_id}</Info>
-                  <Info label="Owner User ID">{app.data.owner_user_id}</Info>
-                  <Info label="Creator User ID">
-                    {app.data.creator_user_id}
-                  </Info>
-                  <Info label="Created">{dateLabel(app.data.created_at)}</Info>
-                  <Info label="Last updated">
-                    {dateLabel(app.data.updated_at)}
-                  </Info>
-                  {app.data.disabled_reason && (
-                    <Info label="Disabled reason">
-                      {app.data.disabled_reason}
+                  <dl className="grid gap-x-8 gap-y-5 pt-5 sm:grid-cols-2 lg:grid-cols-3">
+                    <Info label="Description">{app.data.description}</Info>
+                    <Info label="Discord Bot ID">{app.data.discord_id}</Info>
+                    <Info label="Owner User ID">{app.data.owner_user_id}</Info>
+                    <Info label="Creator User ID">
+                      {app.data.creator_user_id}
                     </Info>
+                    <Info label="Created">
+                      {dateLabel(app.data.created_at)}
+                    </Info>
+                    <Info label="Last updated">
+                      {dateLabel(app.data.updated_at)}
+                    </Info>
+                    {app.data.disabled_reason && (
+                      <Info label="Disabled reason">
+                        {app.data.disabled_reason}
+                      </Info>
+                    )}
+                  </dl>
+                </section>
+                <section className="mt-4 rounded-xl border bg-background p-5 shadow-sm">
+                  <h2 className="text-lg font-semibold">
+                    Editor activity · last 30 days
+                  </h2>
+                  {editorUsage.isPending ? (
+                    <LoadingMessage />
+                  ) : editorUsage.error ? (
+                    <ErrorMessage message={errorMessage(editorUsage.error)} />
+                  ) : (
+                    <dl className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                      <Info label="Active editor time">
+                        {durationLabel(editorUsage.data.total.active_seconds)}
+                      </Info>
+                      <Info label="Editor sessions">
+                        {String(editorUsage.data.total.session_count)}
+                      </Info>
+                      <Info label="Saves">
+                        {String(editorUsage.data.total.save_count)}
+                      </Info>
+                      <Info label="Last edited">
+                        {dateLabel(editorUsage.data.total.last_edited_at)}
+                      </Info>
+                    </dl>
                   )}
-                </dl>
-              </section>
+                </section>
+              </>
             )}
 
             {app.data && section === "logs" && (
@@ -424,6 +483,15 @@ export default function SupportDashboard({ appId }: { appId: string }) {
                           {dateLabel(command.updated_at)}
                         </Info>
                       </dl>
+                      {editorUsage.data && (
+                        <EditorActivity
+                          usage={editorUsage.data.items.find(
+                            (item) =>
+                              item.target_type === "command" &&
+                              item.target_id === command.id
+                          )}
+                        />
+                      )}
                       <SupportFlowViewer
                         flowData={command.flow_source}
                         context="command"
@@ -470,6 +538,15 @@ export default function SupportDashboard({ appId }: { appId: string }) {
                           {dateLabel(listener.updated_at)}
                         </Info>
                       </dl>
+                      {editorUsage.data && (
+                        <EditorActivity
+                          usage={editorUsage.data.items.find(
+                            (item) =>
+                              item.target_type === "event_listener" &&
+                              item.target_id === listener.id
+                          )}
+                        />
+                      )}
                       <SupportFlowViewer
                         flowData={listener.flow_source}
                         context={
@@ -518,6 +595,26 @@ function EmptyMessage({ message }: { message: string }) {
   return (
     <div className="rounded-xl border border-dashed bg-background p-10 text-center text-sm text-muted-foreground">
       {message}
+    </div>
+  );
+}
+
+function EditorActivity({ usage }: { usage?: EditorUsageItem }) {
+  return (
+    <div className="mt-4 rounded-lg border bg-muted/20 p-4">
+      <h3 className="text-sm font-medium">Editor activity · last 30 days</h3>
+      {usage ? (
+        <dl className="mt-3 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
+          <Info label="Active time">{durationLabel(usage.active_seconds)}</Info>
+          <Info label="Sessions">{String(usage.session_count)}</Info>
+          <Info label="Saves">{String(usage.save_count)}</Info>
+          <Info label="Last edited">{dateLabel(usage.last_edited_at)}</Info>
+        </dl>
+      ) : (
+        <p className="mt-2 text-sm text-muted-foreground">
+          No editor activity in the last 30 days.
+        </p>
+      )}
     </div>
   );
 }

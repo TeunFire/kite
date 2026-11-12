@@ -3,6 +3,7 @@ package support
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -15,11 +16,14 @@ import (
 	"gopkg.in/guregu/null.v4"
 )
 
+var editorSessionIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
 type SupportHandler struct {
 	appStore           store.AppStore
 	logStore           store.LogStore
 	commandStore       store.CommandStore
 	eventListenerStore store.EventListenerStore
+	editorSessionStore store.EditorSessionStore
 }
 
 func NewSupportHandler(
@@ -27,12 +31,14 @@ func NewSupportHandler(
 	logStore store.LogStore,
 	commandStore store.CommandStore,
 	eventListenerStore store.EventListenerStore,
+	editorSessionStore store.EditorSessionStore,
 ) *SupportHandler {
 	return &SupportHandler{
 		appStore:           appStore,
 		logStore:           logStore,
 		commandStore:       commandStore,
 		eventListenerStore: eventListenerStore,
+		editorSessionStore: editorSessionStore,
 	}
 }
 
@@ -41,19 +47,19 @@ type AccessResponse struct {
 }
 
 type EventListener struct {
-	ID            string                    `json:"id"`
-	Source        string                    `json:"source"`
-	Type          string                    `json:"type"`
-	Description   string                    `json:"description"`
-	Enabled       bool                      `json:"enabled"`
-	AppID         string                    `json:"app_id"`
-	ModuleID      null.String               `json:"module_id"`
-	CreatorUserID string                    `json:"creator_user_id"`
-	Filter        *wire.EventListenerFilter `json:"filter"`
-	FlowSource    flow.FlowData             `json:"flow_source"`
-	CreatedAt     time.Time                 `json:"created_at"`
-	UpdatedAt     time.Time                 `json:"updated_at"`
-	LastRunAt     null.Time                 `json:"last_run_at"`
+	ID              string                    `json:"id"`
+	Source          string                    `json:"source"`
+	Type            string                    `json:"type"`
+	Description     string                    `json:"description"`
+	Enabled         bool                      `json:"enabled"`
+	AppID           string                    `json:"app_id"`
+	BundleInstallID null.String               `json:"bundle_install_id"`
+	CreatorUserID   string                    `json:"creator_user_id"`
+	Filter          *wire.EventListenerFilter `json:"filter"`
+	FlowSource      flow.FlowData             `json:"flow_source"`
+	CreatedAt       time.Time                 `json:"created_at"`
+	UpdatedAt       time.Time                 `json:"updated_at"`
+	LastRunAt       null.Time                 `json:"last_run_at"`
 }
 
 type EventListenerListResponse []*EventListener
@@ -61,6 +67,29 @@ type EventListenerListResponse []*EventListener
 type LogEntryListResponse struct {
 	Entries    []*wire.LogEntry `json:"entries"`
 	NextBefore int64            `json:"next_before"`
+}
+
+type EditorSessionUpsertRequest struct {
+	TargetType    string `json:"target_type"`
+	TargetID      string `json:"target_id"`
+	ActiveSeconds int    `json:"active_seconds"`
+	SaveCount     int    `json:"save_count"`
+}
+
+type EditorSessionUpsertResponse struct {
+	Saved bool `json:"saved"`
+}
+
+type EditorUsageTotals struct {
+	ActiveSeconds int64      `json:"active_seconds"`
+	SaveCount     int64      `json:"save_count"`
+	SessionCount  int64      `json:"session_count"`
+	LastEditedAt  *time.Time `json:"last_edited_at"`
+}
+
+type EditorUsageResponse struct {
+	Total EditorUsageTotals    `json:"total"`
+	Items []*store.EditorUsage `json:"items"`
 }
 
 func (h *SupportHandler) HandleAccessGet(c *handler.Context) (*AccessResponse, error) {
@@ -150,22 +179,120 @@ func (h *SupportHandler) HandleEventListenerList(c *handler.Context) (*EventList
 	res := make(EventListenerListResponse, len(listeners))
 	for i, listener := range listeners {
 		res[i] = &EventListener{
-			ID:            listener.ID,
-			Source:        string(listener.Source),
-			Type:          string(listener.Type),
-			Description:   listener.Description,
-			Enabled:       listener.Enabled,
-			AppID:         listener.AppID,
-			ModuleID:      listener.ModuleID,
-			CreatorUserID: listener.CreatorUserID,
-			Filter:        (*wire.EventListenerFilter)(listener.Filter),
-			FlowSource:    listener.FlowSource,
-			CreatedAt:     listener.CreatedAt,
-			UpdatedAt:     listener.UpdatedAt,
-			LastRunAt:     listener.LastRunAt,
+			ID:              listener.ID,
+			Source:          string(listener.Source),
+			Type:            string(listener.Type),
+			Description:     listener.Description,
+			Enabled:         listener.Enabled,
+			AppID:           listener.AppID,
+			BundleInstallID: listener.BundleInstallID,
+			CreatorUserID:   listener.CreatorUserID,
+			Filter:          (*wire.EventListenerFilter)(listener.Filter),
+			FlowSource:      listener.FlowSource,
+			CreatedAt:       listener.CreatedAt,
+			UpdatedAt:       listener.UpdatedAt,
+			LastRunAt:       listener.LastRunAt,
 		}
 	}
 	return &res, nil
+}
+
+func (h *SupportHandler) HandleEditorSessionUpsert(
+	c *handler.Context,
+	req EditorSessionUpsertRequest,
+) (*EditorSessionUpsertResponse, error) {
+	sessionID := c.Param("sessionID")
+	if !editorSessionIDPattern.MatchString(sessionID) {
+		return nil, handler.ErrBadRequest("invalid_editor_session", "session ID must be a UUID")
+	}
+	if req.TargetID == "" || len(req.TargetID) > 256 {
+		return nil, handler.ErrBadRequest("invalid_editor_target", "target ID is required")
+	}
+	if req.ActiveSeconds < 0 || req.ActiveSeconds > int((30*24*time.Hour).Seconds()) {
+		return nil, handler.ErrBadRequest("invalid_active_seconds", "active seconds must be between 0 and 30 days")
+	}
+	if req.SaveCount < 0 || req.SaveCount > 1_000_000 {
+		return nil, handler.ErrBadRequest("invalid_save_count", "save count must be between 0 and 1000000")
+	}
+
+	if c.App == nil || c.Session == nil {
+		return nil, fmt.Errorf("editor session request missing app or user context")
+	}
+	if err := h.validateEditorTarget(c, req.TargetType, req.TargetID); err != nil {
+		return nil, err
+	}
+
+	err := h.editorSessionStore.UpsertEditorSession(c.Context(), &store.EditorSession{
+		ID:            sessionID,
+		AppID:         c.App.ID,
+		TargetType:    req.TargetType,
+		TargetID:      req.TargetID,
+		UserID:        c.Session.UserID,
+		ActiveSeconds: req.ActiveSeconds,
+		SaveCount:     req.SaveCount,
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrAlreadyExists) {
+			return nil, handler.ErrConflict("editor_session_conflict", "editor session does not match its original target")
+		}
+		return nil, fmt.Errorf("failed to record editor session: %w", err)
+	}
+	return &EditorSessionUpsertResponse{Saved: true}, nil
+}
+
+func (h *SupportHandler) HandleEditorUsageGet(c *handler.Context) (*EditorUsageResponse, error) {
+	app, err := h.app(c)
+	if err != nil {
+		return nil, err
+	}
+	since := time.Now().UTC().Add(-30 * 24 * time.Hour)
+	items, err := h.editorSessionStore.EditorUsageByApp(c.Context(), app.ID, since)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get support editor usage: %w", err)
+	}
+
+	res := &EditorUsageResponse{Items: items}
+	for _, item := range items {
+		res.Total.ActiveSeconds += item.ActiveSeconds
+		res.Total.SaveCount += item.SaveCount
+		res.Total.SessionCount += item.SessionCount
+		if item.LastEditedAt != nil &&
+			(res.Total.LastEditedAt == nil || item.LastEditedAt.After(*res.Total.LastEditedAt)) {
+			lastEditedAt := *item.LastEditedAt
+			res.Total.LastEditedAt = &lastEditedAt
+		}
+	}
+	return res, nil
+}
+
+func (h *SupportHandler) validateEditorTarget(c *handler.Context, targetType string, targetID string) error {
+	switch targetType {
+	case "command":
+		command, err := h.commandStore.Command(c.Context(), targetID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return handler.ErrNotFound("unknown_command", "Command not found")
+			}
+			return fmt.Errorf("failed to verify editor command: %w", err)
+		}
+		if command.AppID != c.App.ID {
+			return handler.ErrNotFound("unknown_command", "Command not found")
+		}
+	case "event_listener":
+		listener, err := h.eventListenerStore.EventListener(c.Context(), targetID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return handler.ErrNotFound("unknown_event_listener", "Event listener not found")
+			}
+			return fmt.Errorf("failed to verify editor event listener: %w", err)
+		}
+		if listener.AppID != c.App.ID {
+			return handler.ErrNotFound("unknown_event_listener", "Event listener not found")
+		}
+	default:
+		return handler.ErrBadRequest("invalid_editor_target_type", "target type must be command or event_listener")
+	}
+	return nil
 }
 
 func (h *SupportHandler) app(c *handler.Context) (*model.App, error) {
